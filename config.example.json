@@ -1,0 +1,9 @@
+{
+  "character": "default",
+  "scale": null,
+  "bubble_seconds": 15,
+  "sound": null,
+  "hide_when_idle": false,
+  "ignore_kinds": [],
+  "max_task_hours": 12
+}

@@ -1,0 +1,66 @@
+#!/bin/bash
+# BG Buddy 제어기
+DIR="$HOME/Applications/BgBuddy"
+APP="$DIR/BgBuddy.app"
+EXE="$APP/Contents/MacOS/BgBuddy"
+AGENT="$HOME/Library/LaunchAgents/local.bgbuddy.plist"
+
+running() { pgrep -f "MacOS/BgBuddy$" >/dev/null 2>&1; }
+need_app() { [ -x "$EXE" ] || { echo "설치되어 있지 않습니다. 저장소에서 ./install.sh 를 실행하세요."; exit 1; }; }
+
+case "${1:-start}" in
+  start|"")
+    need_app
+    if running; then echo "이미 실행 중"; else open "$APP" && echo "실행됨"; fi ;;
+  stop)
+    pkill -f "MacOS/BgBuddy$" && echo "종료됨" || echo "실행 중이 아님" ;;
+  restart)
+    need_app; pkill -f "MacOS/BgBuddy$" 2>/dev/null; sleep 0.5; open "$APP"; echo "재시작됨" ;;
+  status)
+    running && echo "실행 중 (pid $(pgrep -f 'MacOS/BgBuddy$' | head -1))" || echo "정지됨"
+    [ -f "$AGENT" ] && echo "로그인 자동 실행: 켜짐" || echo "로그인 자동 실행: 꺼짐" ;;
+  tasks|ls)
+    need_app; shift; "$EXE" --tasks "$@" ;;
+  doctor)
+    need_app; "$EXE" --doctor ;;
+  test|poke)
+    need_app
+    running || { echo "실행 중이 아닙니다. buddy start 먼저"; exit 1; }
+    "$EXE" --poke "${2:-done}"
+    echo "보냄: ${2:-done}  (done | failed | many | working)" ;;
+  character|char)
+    need_app
+    if [ -z "$2" ]; then "$EXE" --characters; exit 0; fi
+    "$EXE" --check-character "$2" && "$EXE" --set character "$2" && echo "캐릭터: $2" ;;
+  import)
+    need_app
+    [ -n "$3" ] || { echo "사용법: buddy import <이미지> <이름> [--pixel N] [--align center|left|right] [--height PT]"; exit 2; }
+    shift; "$EXE" --import "$@" ;;
+  set)
+    need_app
+    [ -n "$3" ] || { echo "사용법: buddy set <키> <값>   (값 null 은 기본값으로)"; exit 2; }
+    "$EXE" --set "$2" "$3" ;;
+  config)
+    open -t "$DIR/config.json" ;;
+  open|folder)
+    open "$DIR/characters" ;;
+  rebuild)
+    bash "$DIR/build.sh" "$DIR" && { pkill -f "MacOS/BgBuddy$" 2>/dev/null; sleep 0.5; open "$APP"; echo "재빌드 후 실행됨"; } ;;
+  login-on)
+    launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null; echo "로그인 자동 실행 켬" ;;
+  login-off)
+    launchctl bootout "gui/$(id -u)/local.bgbuddy" 2>/dev/null; echo "로그인 자동 실행 끔 (지금 실행 중인 앱도 종료됨)" ;;
+  help|-h|--help|*)
+    cat <<USAGE
+buddy                    캐릭터 띄우기
+buddy tasks [--debug]    지금 도는 백그라운드 작업과 최근 끝난 작업
+buddy doctor             감지·캐릭터 점검
+buddy test [종류]        말풍선 시험 (done | failed | many | working)
+buddy character [이름]   캐릭터 목록 / 바꾸기
+buddy import 이미지 이름  스프라이트 시트를 캐릭터로 가져오기
+buddy set 키 값          설정 바꾸기 (예: buddy set sound Glass)
+buddy config | open      설정 파일 / 캐릭터 폴더 열기
+buddy stop | restart | status | rebuild | login-on | login-off
+USAGE
+    ;;
+esac

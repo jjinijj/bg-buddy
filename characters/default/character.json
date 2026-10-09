@@ -1,0 +1,15 @@
+{
+  "name": "default",
+  "sheet": "sheet.png",
+  "frameWidth": 247,
+  "frameHeight": 279,
+  "frameCount": 8,
+  "scale": 0.29,
+  "pixelated": false,
+  "animations": {
+    "working": { "frames": [0, 1, 2, 3], "fps": 4, "bob": 3 },
+    "done": { "frames": [4, 5, 5, 5, 4], "fps": 5, "loop": false, "bob": 6 },
+    "idle": { "frames": [6], "fps": 1 },
+    "failed": { "frames": [7], "fps": 1 }
+  }
+}
