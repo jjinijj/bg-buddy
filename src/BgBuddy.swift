@@ -283,12 +283,17 @@ enum Importer {
         let stride_ = max(1, fgCount / 60000)
         var k = 0
         for i in 0..<N where label[i] >= 0 && groupOf[Int(label[i])] >= 0 { if k % stride_ == 0 { samples.append(rgb(i)) }; k += 1 }
-        let pal = kmeans(samples, k: 8)
+        let (pal, rare) = kmeans(samples, k: 8)
         var cls = [Int8](repeating: -1, count: N)
         for i in 0..<N where label[i] >= 0 && groupOf[Int(label[i])] >= 0 {
-            var best = 0, bd = Float.greatestFiniteMagnitude
-            for (p, c) in pal.enumerated() { let d = d2(rgb(i), c); if d < bd { bd = d; best = p } }
-            cls[i] = Int8(best)
+            var best = 0, bd = Float.greatestFiniteMagnitude, bestMajor = 0, bdMajor = Float.greatestFiniteMagnitude
+            for (p, c) in pal.enumerated() {
+                let d = d2(rgb(i), c)
+                if d < bd { bd = d; best = p }
+                if !rare[p] && d < bdMajor { bdMajor = d; bestMajor = p }
+            }
+            // 드문 색은 그 색에 정말 가까운 픽셀에만 쓴다 — 외곽선 번짐이 엉뚱하게 포인트색으로 칠해지지 않게
+            cls[i] = Int8(rare[best] && bd > 40 * 40 ? bestMajor : best)
         }
 
         // 4) 픽셀 크기 — 같은 색이 이어지는 길이들이 모두 어떤 값의 배수에 가까우면 그게 한 칸
@@ -421,8 +426,9 @@ enum Importer {
         return "프레임 \(n)개 · \(note)칸 크기 \(cw)×\(ch) · 팔레트 \(pal.count)색\n저장: \(dir.path)"
     }
 
-    static func kmeans(_ pts: [SIMD3<Float>], k: Int) -> [SIMD3<Float>] {
-        guard !pts.isEmpty else { return [] }
+    // 대표색과, 그중 드물게 쓰인 포인트색인지 여부
+    static func kmeans(_ pts: [SIMD3<Float>], k: Int) -> ([SIMD3<Float>], [Bool]) {
+        guard !pts.isEmpty else { return ([], []) }
         func d2(_ a: SIMD3<Float>, _ b: SIMD3<Float>) -> Float { let d = a - b; return (d * d).sum() }
         // 가장 먼 점부터 고르는 초기화 — 적은 색 수의 그림에서 잘 맞는다
         var cs = [pts[0]]
@@ -441,12 +447,14 @@ enum Importer {
         var cnt = [Int](repeating: 0, count: cs.count)
         for a in assign { cnt[a] += 1 }
         // 드문 색(번짐)은 버리고, 비슷한 색은 합친다
-        var keep = cs.indices.filter { Double(cnt[$0]) >= Double(pts.count) * 0.003 }.sorted { cnt[$0] > cnt[$1] }
-        var out: [SIMD3<Float>] = []
+        // 아주 드문 색(혀·볼터치 같은 작은 포인트)은 기존 대표색과 확실히 다를 때만 살린다 — 잡티는 대개 비슷한 색이다
+        var keep = cs.indices.filter { cnt[$0] >= 8 && Double(cnt[$0]) >= Double(pts.count) * 0.0002 }.sorted { cnt[$0] > cnt[$1] }
+        var out: [SIMD3<Float>] = [], major: [SIMD3<Float>] = [], isRare: [Bool] = []
         while let c = keep.first {
             keep.removeFirst()
             let p = cs[c]
-            if out.contains(where: { d2($0, p) < 45 * 45 }) { continue }
+            let rare = Double(cnt[c]) < Double(pts.count) * 0.003
+            if rare ? major.contains(where: { d2($0, p) < 90 * 90 }) : out.contains(where: { d2($0, p) < 50 * 50 }) { continue }
             // 이미 고른 두 색을 섞은 중간색(외곽선 번짐)이면 버린다. 넓게 칠해진 색은 명암이므로 남긴다
             let blend = Double(cnt[c]) < Double(pts.count) * 0.05 && out.indices.contains { i in out.indices.contains { j in
                 guard i < j else { return false }
@@ -454,9 +462,9 @@ enum Importer {
                 let t = ((p - a) * ab).sum() / max((ab * ab).sum(), 1)
                 return t > 0.1 && t < 0.9 && d2(p, a + ab * t) < 22 * 22
             } }
-            if !blend { out.append(p) }
+            if !blend { out.append(p); isRare.append(rare); if !rare { major.append(p) } }
         }
-        return out.isEmpty ? [cs[0]] : out
+        return out.isEmpty ? ([cs[0]], [false]) : (out, isRare)
     }
 
     static func writePNG(_ rgba: [UInt8], w: Int, h: Int, to url: URL) throws {
