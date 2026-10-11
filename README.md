@@ -69,7 +69,7 @@ buddy test       # 말풍선 시험
 buddy                    캐릭터 띄우기
 buddy tasks [--debug]    지금 도는 백그라운드 작업과 최근 끝난 작업
 buddy doctor             감지·캐릭터 점검
-buddy test [종류]        말풍선 시험 (done | failed | many | working)
+buddy test [종류]        시험 (done | failed | many | working | extra)
 buddy character [이름]   캐릭터 목록 / 바꾸기
 buddy import 이미지 이름  스프라이트 시트를 캐릭터로 가져오기
 buddy set 키 값          설정 바꾸기 (예: buddy set sound Glass)
@@ -111,7 +111,9 @@ characters/my-cat/
   "animations": {
     "working": { "frames": [0, 1, 2, 3], "fps": 4, "bob": 2 },
     "done":    { "frames": [4, 5, 5, 4], "fps": 5, "loop": false },
-    "idle":    { "frames": [6], "fps": 1 },
+    "idle":    { "frames": [6], "fps": 0.5, "bob": 1,
+                 "every": [20, 60],
+                 "extras": [ { "frames": [6, 0, 0, 0, 6], "fps": 3 } ] },
     "failed":  { "frames": [7], "fps": 1 }
   }
 }
@@ -123,9 +125,20 @@ characters/my-cat/
 | `fps` | 초당 프레임 |
 | `loop` | 반복 여부. `done` 만 기본값이 `false` |
 | `bob` | 프레임마다 통통 튀는 높이(pt). 그림이 거의 같은 프레임도 움직여 보입니다 |
+| `extras` | 반복하는 동안 가끔 한 번씩 끼워 넣는 동작 목록. 각 항목은 `frames`·`fps`·`bob` |
+| `every` | `extras` 를 몇 초에 한 번 할지 `[최소, 최대]`. 기본 `[20, 60]`, 그 사이 무작위 |
 | `pixelated` | `true` 면 확대할 때 픽셀을 뭉개지 않음 |
 
 없는 상태는 비슷한 것으로 대신합니다 (`failed` 가 없으면 `idle`).
+
+`extras` 는 같은 동작만 반복하면 단조로워서 넣은 기능입니다 — 자다가 가끔 눈을 뜨거나
+하품하는 식입니다. 상태가 바뀌면 하던 동작을 바로 끊습니다. `buddy test extra` 로
+기다리지 않고 바로 볼 수 있습니다.
+
+**캐릭터 하나에 시트 한 장**으로 관리하세요. 동작을 늘릴 때는 기존 프레임 번호를 그대로 두고
+뒤에 붙이면 다른 애니메이션 설정을 고칠 필요가 없습니다. 이미지 생성 AI 로 늘릴 때는
+추가 프레임만 따로 받지 말고, 기존 시트를 참고 이미지로 주고 전체를 한 장으로 다시 받는
+편이 크기·선 굵기·색이 맞습니다.
 
 ### 이미지 생성 AI 로 만든 시트 가져오기
 

@@ -27,7 +27,7 @@ case "${1:-start}" in
     need_app
     running || { echo "실행 중이 아닙니다. buddy start 먼저"; exit 1; }
     "$EXE" --poke "${2:-done}"
-    echo "보냄: ${2:-done}  (done | failed | many | working)" ;;
+    echo "보냄: ${2:-done}  (done | failed | many | working | extra)" ;;
   character|char)
     need_app
     if [ -z "$2" ]; then "$EXE" --characters; exit 0; fi
@@ -55,7 +55,7 @@ case "${1:-start}" in
 buddy                    캐릭터 띄우기
 buddy tasks [--debug]    지금 도는 백그라운드 작업과 최근 끝난 작업
 buddy doctor             감지·캐릭터 점검
-buddy test [종류]        말풍선 시험 (done | failed | many | working)
+buddy test [종류]        시험 (done | failed | many | working | extra)
 buddy character [이름]   캐릭터 목록 / 바꾸기
 buddy import 이미지 이름  스프라이트 시트를 캐릭터로 가져오기
 buddy set 키 값          설정 바꾸기 (예: buddy set sound Glass)

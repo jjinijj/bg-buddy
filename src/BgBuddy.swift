@@ -89,6 +89,8 @@ struct Anim {
     var fps: Double
     var loop: Bool
     var bob = 0.0            // 프레임마다 통통 튀는 높이(pt). 그림이 거의 같은 프레임도 움직여 보이게 한다
+    var extras: [Anim] = []  // 반복하는 동안 가끔 한 번씩 끼워 넣는 동작
+    var every = (min: 20.0, max: 60.0)
     var duration: Double { Double(frames.count) / max(fps, 0.1) }
 }
 
@@ -152,13 +154,21 @@ final class Character {
         }
         guard !frames.isEmpty else { throw BuddyError("프레임이 없음") }
         var anims: [String: Anim] = [:]
-        for (k, v) in (j["animations"] as? [String: Any]) ?? [:] {
-            guard let a = v as? [String: Any], let fr = a["frames"] as? [Int], !fr.isEmpty else { continue }
+        func parse(_ name: String, _ a: [String: Any], loop defaultLoop: Bool) throws -> Anim? {
+            guard let fr = a["frames"] as? [Int], !fr.isEmpty else { return nil }
             if let bad = fr.first(where: { $0 < 0 || $0 >= frames.count }) {
-                throw BuddyError("애니메이션 '\(k)' 의 프레임 \(bad) 이 범위(0~\(frames.count - 1))를 벗어남")
+                throw BuddyError("애니메이션 '\(name)' 의 프레임 \(bad) 이 범위(0~\(frames.count - 1))를 벗어남")
             }
-            anims[k] = Anim(frames: fr, fps: (a["fps"] as? Double) ?? 4, loop: (a["loop"] as? Bool) ?? (k != "done"),
-                            bob: (a["bob"] as? Double) ?? 0)
+            var an = Anim(frames: fr, fps: (a["fps"] as? Double) ?? 4, loop: (a["loop"] as? Bool) ?? defaultLoop,
+                          bob: (a["bob"] as? Double) ?? 0)
+            for (i, e) in ((a["extras"] as? [[String: Any]]) ?? []).enumerated() {
+                if let x = try parse("\(name).extras[\(i)]", e, loop: false) { an.extras.append(x) }
+            }
+            if let ev = a["every"] as? [Double], ev.count == 2, ev[0] > 0, ev[1] >= ev[0] { an.every = (ev[0], ev[1]) }
+            return an
+        }
+        for (k, v) in (j["animations"] as? [String: Any]) ?? [:] {
+            if let a = v as? [String: Any], let an = try parse(k, a, loop: k != "done") { anims[k] = an }
         }
         let scale = CGFloat(scaleOverride ?? (j["scale"] as? Double) ?? 3)
         return Character(name: name, frames: frames, frameSize: CGSize(width: fw, height: fh),
@@ -780,9 +790,35 @@ final class BuddyView: NSView {
         spriteRect = NSRect(x: ((bounds.width - s.width) / 2).rounded(), y: 2, width: s.width, height: s.height)
     }
 
+    // 가끔 하는 동작이 재생 중이면 그것, 아니면 상태의 기본 동작
+    private var extra: Anim?
+    private var extraStart = Date()
+    private var nextExtraAt: Date?
+
+    func active() -> (anim: Anim, start: Date) {
+        if let e = extra { return (e, extraStart) }
+        return (character.anim(mood.rawValue), moodStart)
+    }
+
+    func resetExtras() { extra = nil; nextExtraAt = nil }
+
+    // 기본 동작을 반복하다가 every 범위의 무작위 시점에 extras 중 하나를 한 번 재생한다
+    func updateExtras(_ now: Date, force: Bool = false) {
+        let base = character.anim(mood.rawValue)
+        guard base.loop, !base.extras.isEmpty else { resetExtras(); return }
+        if let e = extra {
+            guard now.timeIntervalSince(extraStart) >= e.duration else { return }
+            extra = nil; nextExtraAt = nil
+        }
+        if nextExtraAt == nil { nextExtraAt = now.addingTimeInterval(Double.random(in: base.every.min...base.every.max)) }
+        if force || now >= nextExtraAt! { extra = base.extras.randomElement(); extraStart = now }
+    }
+
+    var hasExtras: Bool { !character.anim(mood.rawValue).extras.isEmpty }
+
     func currentFrame() -> Int {
-        let a = character.anim(mood.rawValue)
-        var i = Int(Date().timeIntervalSince(moodStart) * a.fps)
+        let (a, start) = active()
+        var i = Int(Date().timeIntervalSince(start) * a.fps)
         i = a.loop ? i % a.frames.count : min(i, a.frames.count - 1)
         return a.frames[i]
     }
@@ -791,10 +827,10 @@ final class BuddyView: NSView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         layoutSprite()
         ctx.interpolationQuality = character.pixelated ? .none : .high
-        let a = character.anim(mood.rawValue)
+        let (a, start) = active()
         var r = spriteRect
         if a.bob > 0 {
-            let phase = (Date().timeIntervalSince(moodStart) * a.fps).truncatingRemainder(dividingBy: 1)
+            let phase = (Date().timeIntervalSince(start) * a.fps).truncatingRemainder(dividingBy: 1)
             r.origin.y += (CGFloat(a.bob) * CGFloat(sin(phase * .pi))).rounded()
         }
         ctx.draw(character.frames[currentFrame()], in: r)
@@ -958,6 +994,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         config = Config.load()
         let anchor = NSPoint(x: panel.frame.midX, y: panel.frame.minY + 2)
         view.character = loadCharacter()
+        view.resetExtras()  // 이전 캐릭터의 프레임 번호가 남지 않게
         view.setFrameSize(BuddyView.size(for: view.character))
         placeWindow(anchor: anchor)
         let c = config
@@ -1005,7 +1042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .idle
     }
 
-    func setMood(_ m: Mood) { view.mood = m; view.moodStart = Date() }
+    func setMood(_ m: Mood) { view.mood = m; view.moodStart = Date(); view.resetExtras() }
 
     func tick() {
         let now = Date()
@@ -1033,7 +1070,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !hide && !panel.isVisible { panel.orderFrontRegardless() }
 
         let f = view.currentFrame()
-        let moving = view.character.anim(view.mood.rawValue).bob > 0
+        view.updateExtras(now)
+        let moving = view.active().anim.bob > 0
         if f != lastFrame || moving || view.bubble != nil || view.needsDisplay { lastFrame = f; view.needsDisplay = true }
     }
 
@@ -1058,6 +1096,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         switch kind {
         case "working": demoUntil = now.addingTimeInterval(8)
+        case "extra":
+            if view.hasExtras { view.updateExtras(now, force: true) }
+            else { view.bubble = Bubble(title: "가끔 하는 동작 없음", body: "지금 상태(\(view.mood.rawValue))에 extras 가 없어요", sub: "", seconds: 4); bubbleShownAt = now }
         case "failed": apply(tasks, [fake("테스트 작업", "failed", 42)])
         case "many": apply(tasks, [fake("데이터 정리", "completed", 95), fake("로그 분석", "completed", 130), fake("빌드", "failed", 61)])
         default: apply(tasks, [fake("테스트 작업", "completed", 133)])

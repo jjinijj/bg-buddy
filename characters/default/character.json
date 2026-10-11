@@ -7,9 +7,68 @@
   "scale": 0.29,
   "pixelated": false,
   "animations": {
-    "working": { "frames": [0, 1, 2, 3], "fps": 4, "bob": 3 },
-    "done": { "frames": [4, 5, 5, 5, 4], "fps": 5, "loop": false, "bob": 6 },
-    "idle": { "frames": [6], "fps": 1 },
-    "failed": { "frames": [7], "fps": 1 }
+    "working": {
+      "frames": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "fps": 4,
+      "bob": 3
+    },
+    "done": {
+      "frames": [
+        4,
+        5,
+        5,
+        5,
+        4
+      ],
+      "fps": 5,
+      "loop": false,
+      "bob": 6
+    },
+    "idle": {
+      "frames": [
+        6
+      ],
+      "fps": 0.5,
+      "bob": 1,
+      "every": [
+        20,
+        60
+      ],
+      "extras": [
+        {
+          "frames": [
+            6,
+            0,
+            0,
+            0,
+            0,
+            6
+          ],
+          "fps": 3
+        },
+        {
+          "frames": [
+            6,
+            4,
+            4,
+            4,
+            6
+          ],
+          "fps": 2,
+          "bob": 2
+        }
+      ]
+    },
+    "failed": {
+      "frames": [
+        7
+      ],
+      "fps": 1
+    }
   }
 }
