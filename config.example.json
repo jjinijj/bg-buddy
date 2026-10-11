@@ -1,5 +1,8 @@
 {
   "character": "default",
+  "visible": true,
+  "menu_bar_icon": true,
+  "size": 1,
   "scale": null,
   "bubble_seconds": 15,
   "sound": null,

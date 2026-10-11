@@ -39,6 +39,9 @@ struct Config {
     var bubbleSeconds = 15.0
     var sound: String?
     var hideWhenIdle = false
+    var visible = true          // 캐릭터 보이기 (끄면 말풍선도 안 뜨고 메뉴 막대에만 표시)
+    var menuBarIcon = true
+    var size = 1.0              // 캐릭터 기본 크기에 곱하는 배율
     var ignoreKinds: Set<String> = []
     var maxTaskHours = 12.0
     var claudeDir: String?
@@ -57,6 +60,9 @@ struct Config {
         if let v = j["bubble_seconds"] as? Double { c.bubbleSeconds = v }
         if let v = j["sound"] as? String, !v.isEmpty { c.sound = v }
         if let v = j["hide_when_idle"] as? Bool { c.hideWhenIdle = v }
+        if let v = j["visible"] as? Bool { c.visible = v }
+        if let v = j["menu_bar_icon"] as? Bool { c.menuBarIcon = v }
+        if let v = j["size"] as? Double, v > 0 { c.size = v }
         if let v = j["ignore_kinds"] as? [String] { c.ignoreKinds = Set(v.map { $0.lowercased() }) }
         if let v = j["max_task_hours"] as? Double, v > 0 { c.maxTaskHours = v }
         if let v = j["claude_dir"] as? String, !v.isEmpty { c.claudeDir = v }
@@ -127,7 +133,7 @@ final class Character {
         }.sorted()
     }
 
-    static func load(_ name: String, scaleOverride: Double? = nil) throws -> Character {
+    static func load(_ name: String, scaleOverride: Double? = nil, size: Double = 1) throws -> Character {
         let dir = Paths.characters.appendingPathComponent(name)
         let jf = dir.appendingPathComponent("character.json")
         guard let d = try? Data(contentsOf: jf) else { throw BuddyError("캐릭터 '\(name)' 없음: \(jf.path)") }
@@ -170,7 +176,7 @@ final class Character {
         for (k, v) in (j["animations"] as? [String: Any]) ?? [:] {
             if let a = v as? [String: Any], let an = try parse(k, a, loop: k != "done") { anims[k] = an }
         }
-        let scale = CGFloat(scaleOverride ?? (j["scale"] as? Double) ?? 3)
+        let scale = CGFloat((scaleOverride ?? (j["scale"] as? Double) ?? 3) * size)
         return Character(name: name, frames: frames, frameSize: CGSize(width: fw, height: fh),
                          scale: scale, pixelated: (j["pixelated"] as? Bool) ?? true, anims: anims)
     }
@@ -919,8 +925,11 @@ final class BuddyView: NSView {
     override func rightMouseDown(with e: NSEvent) { onMenu?(e) }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var panel: NSPanel!
+    var statusItem: NSStatusItem?
+    var doneMarkUntil: Date?        // 메뉴 막대에 ✓ 를 띄워 둘 시각
+    var statusShown = ""
     var view: BuddyView!
     var config = Config.load()
     var tracker: Tracker!
@@ -933,9 +942,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastFrame = -1
 
     func applicationDidFinishLaunching(_ n: Notification) {
-        if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.bgbuddy").count > 1 {
-            NSApp.terminate(nil); return
-        }
+        // 먼저 뜬 인스턴스가 있을 때만 양보한다 — 둘이 동시에 뜨면 서로 양보해 둘 다 꺼지는 일을 막는다
+        let me = NSRunningApplication.current
+        let older = NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.bgbuddy")
+            .filter { $0.processIdentifier != me.processIdentifier && !$0.isTerminated }
+            .contains { ($0.launchDate ?? .distantPast) < (me.launchDate ?? .distantFuture) }
+        if older { NSApp.terminate(nil); return }
         tracker = Tracker(config: config)
         view = BuddyView(character: loadCharacter())
         panel = NSPanel(contentRect: NSRect(origin: .zero, size: view.frame.size),
@@ -949,6 +961,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = view
         placeWindow(anchor: savedAnchor())
         panel.orderFrontRegardless()
+        updateStatusItem()
 
         view.onClick = { [weak self] in self?.clicked() }
         view.onMenu = { [weak self] e in self?.showMenu(e) }
@@ -968,10 +981,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func loadCharacter() -> Character {
-        do { return try Character.load(config.character, scaleOverride: config.scale) }
+        do { return try Character.load(config.character, scaleOverride: config.scale, size: config.size) }
         catch {
             NSLog("BgBuddy: \(error)")
-            return (try? Character.load("default", scaleOverride: config.scale)) ?? Character.fallback()
+            return (try? Character.load("default", scaleOverride: config.scale, size: config.size)) ?? Character.fallback()
         }
     }
 
@@ -1007,6 +1020,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         placeWindow(anchor: anchor)
         let c = config
         queue.async { self.tracker.config = c }
+        updateStatusItem(rebuildIcon: true)
         view.needsDisplay = true
     }
 
@@ -1026,7 +1040,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         tasks = running
         view.badge = running.count
         let shown = events.filter { $0.ok || $0.failed }
-        guard !shown.isEmpty else { return }
+        guard !shown.isEmpty else { refreshStatusTitle(); return }
+        doneMarkUntil = Date().addingTimeInterval(max(config.bubbleSeconds, 15))
+        refreshStatusTitle()
+        // 캐릭터를 꺼 두었으면 말풍선을 쌓지 않는다 — 다시 켰을 때 지난 알림이 몰려 뜨지 않게
+        guard config.visible else { return }
         if shown.count >= 3 {
             let labels = shown.map(\.label).joined(separator: ", ")
             let sessions = Array(Set(shown.map(\.sessionName))).sorted().joined(separator: ", ")
@@ -1073,7 +1091,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.ignoresMouseEvents = !view.hit(p)
         view.toolTip = tasks.isEmpty ? nil : tasks.map { "· \($0.label) — \($0.sessionName) · \(formatDuration(now.timeIntervalSince($0.startedAt)))" }.joined(separator: "\n")
 
-        let hide = config.hideWhenIdle && baseMood == .idle && view.mood == .idle && view.bubble == nil
+        let hide = !config.visible || (config.hideWhenIdle && baseMood == .idle && view.mood == .idle && view.bubble == nil)
+        if let d = doneMarkUntil, d <= now { doneMarkUntil = nil; refreshStatusTitle() }
         if hide && panel.isVisible { panel.orderOut(nil) }
         if !hide && !panel.isVisible { panel.orderFrontRegardless() }
 
@@ -1117,7 +1136,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func showMenu(_ e: NSEvent) {
         let menu = NSMenu()
+        fillMenu(menu)
+        NSMenu.popUpContextMenu(menu, with: e, for: view)
+    }
+
+    // 메뉴 막대 아이콘 메뉴는 열 때마다 새로 채운다
+    func menuNeedsUpdate(_ menu: NSMenu) { menu.removeAllItems(); fillMenu(menu) }
+
+    func fillMenu(_ menu: NSMenu) {
         let now = Date()
+        let vis = NSMenuItem(title: "캐릭터 보이기", action: #selector(toggleVisible), keyEquivalent: "")
+        vis.target = self; vis.state = config.visible ? .on : .off
+        menu.addItem(vis)
+        menu.addItem(.separator())
         let head = NSMenuItem(title: tasks.isEmpty ? "백그라운드 작업 없음" : "백그라운드 작업 \(tasks.count)개", action: nil, keyEquivalent: "")
         head.isEnabled = false
         menu.addItem(head)
@@ -1139,10 +1170,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(ci)
 
         let sizes = NSMenu()
-        for (title, v) in [("기본", 0.0), ("1배", 1), ("2배", 2), ("3배", 3), ("4배", 4)] {
-            let it = NSMenuItem(title: title, action: #selector(pickScale(_:)), keyEquivalent: "")
-            it.target = self; it.tag = Int(v)
-            it.state = (config.scale ?? 0) == v ? .on : .off
+        for (title, v) in [("작게", 0.75), ("기본", 1.0), ("크게", 1.5), ("아주 크게", 2.0)] {
+            let it = NSMenuItem(title: title, action: #selector(pickSize(_:)), keyEquivalent: "")
+            it.target = self; it.representedObject = v
+            it.state = abs(config.size - v) < 0.01 ? .on : .off
             sizes.addItem(it)
         }
         let si = NSMenuItem(title: "크기", action: nil, keyEquivalent: ""); si.submenu = sizes
@@ -1151,12 +1182,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hide = NSMenuItem(title: "쉴 때 숨기기", action: #selector(toggleHide), keyEquivalent: "")
         hide.target = self; hide.state = config.hideWhenIdle ? .on : .off
         menu.addItem(hide)
+        let icon = NSMenuItem(title: "메뉴 막대 아이콘", action: #selector(toggleIcon), keyEquivalent: "")
+        icon.target = self; icon.state = config.menuBarIcon ? .on : .off
+        menu.addItem(icon)
         let test = NSMenuItem(title: "말풍선 테스트", action: #selector(testBubble), keyEquivalent: "")
-        test.target = self
+        test.target = self; test.isEnabled = config.visible
         menu.addItem(test)
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
-        NSMenu.popUpContextMenu(menu, with: e, for: view)
+    }
+
+    // MARK: 메뉴 막대 아이콘
+
+    func updateStatusItem(rebuildIcon: Bool = false) {
+        if !config.menuBarIcon {
+            if let s = statusItem { NSStatusBar.system.removeStatusItem(s); statusItem = nil }
+            return
+        }
+        if statusItem == nil {
+            let s = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            let m = NSMenu(); m.delegate = self
+            s.menu = m
+            s.button?.imagePosition = .imageLeading
+            statusItem = s
+            statusShown = ""
+            rebuildStatusIcon()
+        } else if rebuildIcon {
+            rebuildStatusIcon()
+        }
+        refreshStatusTitle()
+    }
+
+    // 캐릭터의 쉬는 프레임을 메뉴 막대 높이에 맞춰 줄인다
+    func rebuildStatusIcon() {
+        guard let button = statusItem?.button else { return }
+        let c = view.character
+        let frame = c.frames[c.anim("idle").frames[0]]
+        let h: CGFloat = 18, w = min(28, h * CGFloat(frame.width) / CGFloat(frame.height))
+        let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { r in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            ctx.interpolationQuality = c.pixelated ? .none : .high
+            let fw = CGFloat(frame.width), fh = CGFloat(frame.height)
+            let s = min(r.width / fw, r.height / fh)
+            ctx.draw(frame, in: CGRect(x: (r.width - fw * s) / 2, y: (r.height - fh * s) / 2, width: fw * s, height: fh * s))
+            return true
+        }
+        button.image = img
+        button.toolTip = "BG Buddy"
+    }
+
+    // 작업 수 / 방금 끝남(✓) / 꺼져 있음 표시. 바뀔 때만 다시 그린다
+    func refreshStatusTitle() {
+        guard let button = statusItem?.button else { return }
+        var t = ""
+        if !tasks.isEmpty { t = " \(tasks.count)" }
+        else if doneMarkUntil != nil { t = " ✓" }
+        if t != statusShown { button.title = t; statusShown = t }
+        button.appearsDisabled = !config.visible
     }
 
     @objc func pickCharacter(_ s: NSMenuItem) {
@@ -1170,7 +1252,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             bubbleShownAt = Date()
         }
     }
-    @objc func pickScale(_ s: NSMenuItem) { try? Config.set("scale", s.tag == 0 ? nil : s.tag); reload() }
+    @objc func pickSize(_ s: NSMenuItem) { try? Config.set("size", (s.representedObject as? Double) ?? 1); reload() }
+    @objc func toggleVisible() {
+        // 아이콘까지 꺼져 있으면 다시 켤 방법이 없어지므로 캐릭터를 끌 때 아이콘을 살린다
+        if config.visible && !config.menuBarIcon { try? Config.set("menu_bar_icon", true) }
+        try? Config.set("visible", !config.visible); reload()
+    }
+    @objc func toggleIcon() {
+        if config.menuBarIcon && !config.visible { try? Config.set("visible", true) }
+        try? Config.set("menu_bar_icon", !config.menuBarIcon); reload()
+    }
     @objc func toggleHide() { try? Config.set("hide_when_idle", !config.hideWhenIdle); reload() }
     @objc func testBubble() { poke("done") }
 }

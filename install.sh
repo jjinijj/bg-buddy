@@ -48,8 +48,9 @@ PLIST
 launchctl bootout "gui/$(id -u)/local.bgbuddy" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null || true
 
-pkill -f "MacOS/BgBuddy" 2>/dev/null || true
-sleep 0.5
+# 자동 실행 등록이 띄운 것까지 모두 끈 뒤, 완전히 꺼진 걸 확인하고 하나만 연다
+pkill -f "MacOS/BgBuddy$" 2>/dev/null || true
+for _ in $(seq 1 30); do pgrep -f "MacOS/BgBuddy$" >/dev/null || break; sleep 0.1; done
 open "$APP"
 echo
 echo "설치 완료. 캐릭터가 화면 오른쪽 아래에 떠 있습니다."
