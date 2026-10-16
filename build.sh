@@ -16,9 +16,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>BgBuddy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
 </dict></plist>
 PLIST
+cp "$DIR/AppIcon.icns" "$APP/Contents/Resources/" 2>/dev/null || true
 codesign --force -s - "$APP" 2>/dev/null || true
 echo "built: $APP"
