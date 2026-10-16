@@ -8,5 +8,6 @@
   "sound": null,
   "hide_when_idle": false,
   "ignore_kinds": [],
-  "max_task_hours": 12
+  "max_task_hours": 12,
+  "stale_minutes": 30
 }

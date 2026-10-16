@@ -46,6 +46,7 @@ struct Config {
     var size = 1.0              // 캐릭터 기본 크기에 곱하는 배율
     var ignoreKinds: Set<String> = []
     var maxTaskHours = 12.0
+    var staleMinutes = 30.0     // 출력이 이만큼 없으면 "오래됨?" 표시 (목록에서 빼지는 않음)
     var claudeDir: String?
 
     static func raw() -> [String: Any] {
@@ -67,6 +68,7 @@ struct Config {
         if let v = j["size"] as? Double, v > 0 { c.size = v }
         if let v = j["ignore_kinds"] as? [String] { c.ignoreKinds = Set(v.map { $0.lowercased() }) }
         if let v = j["max_task_hours"] as? Double, v > 0 { c.maxTaskHours = v }
+        if let v = j["stale_minutes"] as? Double, v > 0 { c.staleMinutes = v }
         if let v = j["claude_dir"] as? String, !v.isEmpty { c.claudeDir = v }
         return c
     }
@@ -499,6 +501,14 @@ struct BgTask {
     let label: String
     var sessionName: String
     let startedAt: Date
+    var outputFile: String?  // 출력이 쌓이는 파일. 모르면 nil — 그때는 "오래됨?"을 판단하지 않는다
+    var lastOutput: Date?    // 출력 파일이 마지막으로 바뀐 시각
+
+    // 출력이 staleAfter 초 넘게 없는 작업. 출력 위치를 모르면 의심하지 않는다
+    func idle(_ now: Date) -> TimeInterval? {
+        guard outputFile != nil else { return nil }
+        return now.timeIntervalSince(max(startedAt, lastOutput ?? startedAt))
+    }
 }
 
 struct Finished {
@@ -510,6 +520,8 @@ struct Finished {
     let at: Date
     var ok: Bool { status == "completed" }
     var failed: Bool { status.hasPrefix("fail") || status == "error" }
+    // 신호를 받고 끝난 작업(사용자나 Claude 가 직접 끈 서버 등). 오류로 보지 않는다
+    var stopped: Bool { status == "stopped" || status == "killed" }
 }
 
 final class SessionWatch {
@@ -557,7 +569,14 @@ final class Tracker {
         var out: [Finished] = []
         for w in watches.values { out += read(w) }
         let cutoff = Date().addingTimeInterval(-config.maxTaskHours * 3600)
-        for w in watches.values { w.running = w.running.filter { $0.value.startedAt > cutoff } }
+        for w in watches.values {
+            w.running = w.running.filter { $0.value.startedAt > cutoff }
+            for (k, t) in w.running {
+                guard let f = t.outputFile,
+                      let m = (try? FileManager.default.attributesOfItem(atPath: f))?[.modificationDate] as? Date else { continue }
+                w.running[k]?.lastOutput = m
+            }
+        }
         return out
     }
 
@@ -665,7 +684,7 @@ final class Tracker {
             switch b["type"] as? String {
             case "tool_use": toolUse(b, w)
             case "tool_result":
-                if let r = j["toolUseResult"] as? [String: Any] { toolResult(b, r, ts: ts, w) }
+                if let r = j["toolUseResult"] as? [String: Any] { toolResult(b, r, ts: ts, w, sessionId: w.sessionId) }
             default: break
             }
         }
@@ -688,7 +707,7 @@ final class Tracker {
         w.tools[id] = (name, label.isEmpty ? name : label)
     }
 
-    private func toolResult(_ b: [String: Any], _ r: [String: Any], ts: Date?, _ w: SessionWatch) {
+    private func toolResult(_ b: [String: Any], _ r: [String: Any], ts: Date?, _ w: SessionWatch, sessionId: String) {
         guard let id = b["tool_use_id"] as? String else { return }
         let tool = w.tools.removeValue(forKey: id)
         guard !w.ended.contains(id), w.running[id] == nil else { return }
@@ -701,12 +720,25 @@ final class Tracker {
         let desc = (r["description"] as? String) ?? ""
         let label = desc.isEmpty ? (tool?.label ?? (name.isEmpty ? "작업" : name)) : desc
         w.running[id] = BgTask(key: id, taskId: tid, kind: name.isEmpty ? "task" : name.lowercased(),
-                               label: label, sessionName: w.name, startedAt: ts ?? Date())
+                               label: label, sessionName: w.name, startedAt: ts ?? Date(),
+                               outputFile: Self.outputFile(r, b, taskId: tid, sessionId: sessionId))
         w.starts += 1
     }
 
+    // 출력 파일 위치: Agent 는 결과에 outputFile, Bash 는 결과 문구의 "Output is being written to: …"
+    static func outputFile(_ r: [String: Any], _ b: [String: Any], taskId: String, sessionId: String) -> String? {
+        if let f = r["outputFile"] as? String, !f.isEmpty { return f }
+        var text = b["content"] as? String ?? ""
+        for x in (b["content"] as? [[String: Any]]) ?? [] { text += (x["text"] as? String) ?? "" }
+        if let a = text.range(of: "written to: ") {
+            let rest = text[a.upperBound...]
+            if let e = rest.range(of: ".output") { return String(rest[..<e.upperBound]) }
+        }
+        return nil
+    }
+
     private func notification(_ s: String, ts: Date?, _ w: SessionWatch, live: Bool) -> Finished? {
-        guard let status = Self.tag(s, "status")?.lowercased() else {
+        guard var status = Self.tag(s, "status")?.lowercased() else {
             // Monitor 의 중간 이벤트(<event>) 등은 끝난 게 아니다
             if Self.tag(s, "event") == nil && Self.tag(s, "task-type") == nil { w.unknownNotes += 1 }
             return nil
@@ -721,6 +753,11 @@ final class Tracker {
             task = w.running.removeValue(forKey: k)
         }
         let summary = Self.tag(s, "summary") ?? ""
+        // 종료 코드 128 이상은 신호로 끝난 것(143 = TERM 등) — 직접 끈 서버를 실패로 띄우지 않는다
+        if status.hasPrefix("fail"), let r = summary.range(of: "exit code "),
+           let code = Int(summary[r.upperBound...].prefix { $0.isNumber }), code >= 128 {
+            status = "stopped"
+        }
         let f = Finished(label: task?.label ?? Self.quoted(summary) ?? summary, kind: task?.kind ?? "",
                          status: status, sessionName: w.name, startedAt: task?.startedAt, at: ts ?? Date())
         w.history.append(f)
@@ -770,6 +807,7 @@ struct Bubble {
     var sub: String
     var failed = false
     var seconds: Double?     // nil 이면 설정값
+    var muted = false        // 멈춤 같은 중립 알림 — 회색
 }
 
 final class BuddyView: NSView {
@@ -891,7 +929,8 @@ final class BuddyView: NSView {
         tail.move(to: NSPoint(x: tx - 6, y: rect.minY + 1))
         tail.line(to: NSPoint(x: tx, y: rect.minY - 8))
         tail.line(to: NSPoint(x: tx + 6, y: rect.minY + 1))
-        let fill = b.failed ? NSColor(red: 1, green: 0.92, blue: 0.91, alpha: 0.98) : NSColor(white: 1, alpha: 0.98)
+        let fill = b.failed ? NSColor(red: 1, green: 0.92, blue: 0.91, alpha: 0.98)
+            : b.muted ? NSColor(white: 0.9, alpha: 0.98) : NSColor(white: 1, alpha: 0.98)
         fill.setFill(); ink.setStroke()
         path.lineWidth = 1.5; tail.lineWidth = 1.5
         path.fill(); path.stroke()
@@ -932,6 +971,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem?
     var doneMarkUntil: Date?        // 메뉴 막대에 ✓ 를 띄워 둘 시각
     var statusShown = ""
+    var dismissed: Set<String> = []
     var view: BuddyView!
     var config = Config.load()
     var tracker: Tracker!
@@ -1052,8 +1092,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func apply(_ running: [BgTask], _ events: [Finished]) {
-        tasks = running
-        view.badge = running.count
+        // 목록에서 지운 작업은 BG Buddy 화면에서만 뺀다. 나중에 끝나면 말풍선은 그대로 뜬다
+        dismissed.formIntersection(running.map(\.key))
+        tasks = running.filter { !dismissed.contains($0.key) }
+        view.badge = tasks.count
+        if config.visible {
+            for f in events where f.stopped {
+                bubbles.append(Bubble(title: "멈췄어", body: f.label, sub: f.sessionName + " · 직접 끈 작업", seconds: 5, muted: true))
+            }
+        }
         let shown = events.filter { $0.ok || $0.failed }
         guard !shown.isEmpty else { refreshStatusTitle(); return }
         doneMarkUntil = Date().addingTimeInterval(max(config.bubbleSeconds, 15))
@@ -1142,6 +1189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if view.hasExtras { view.updateExtras(now, force: true) }
             else { view.bubble = Bubble(title: "가끔 하는 동작 없음", body: "지금 상태(\(view.mood.rawValue))에 extras 가 없어요", sub: "", seconds: 4); bubbleShownAt = now }
         case "failed": apply(tasks, [fake("테스트 작업", "failed", 42)])
+        case "stopped": apply(tasks, [fake("테스트 서버", "stopped", 300)])
         case "many": apply(tasks, [fake("데이터 정리", "completed", 95), fake("로그 분석", "completed", 130), fake("빌드", "failed", 61)])
         default: apply(tasks, [fake("테스트 작업", "completed", 133)])
         }
@@ -1168,8 +1216,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         head.isEnabled = false
         menu.addItem(head)
         for t in tasks.prefix(12) {
-            let it = NSMenuItem(title: "  \(t.label) — \(t.sessionName) · \(formatDuration(now.timeIntervalSince(t.startedAt)))", action: nil, keyEquivalent: "")
-            it.isEnabled = false
+            var title = "\(t.label) — \(t.sessionName) · \(formatDuration(now.timeIntervalSince(t.startedAt)))"
+            let stale = (t.idle(now) ?? 0) > config.staleMinutes * 60
+            if stale, let i = t.idle(now) { title += " · 오래됨? (\(formatDuration(i))째 출력 없음)" }
+            let it = NSMenuItem(title: (stale ? "◌ " : "● ") + title, action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            let open = NSMenuItem(title: "출력 열기", action: #selector(openOutput(_:)), keyEquivalent: "")
+            open.target = self; open.representedObject = t.outputFile
+            open.isEnabled = t.outputFile.map { FileManager.default.fileExists(atPath: $0) } ?? false
+            sub.addItem(open)
+            let drop = NSMenuItem(title: "목록에서 지우기", action: #selector(dismissTask(_:)), keyEquivalent: "")
+            drop.target = self; drop.representedObject = t.key
+            sub.addItem(drop)
+            let note = NSMenuItem(title: "작업을 끄지는 않습니다 — 끄려면 그 세션에 요청하세요", action: nil, keyEquivalent: "")
+            note.isEnabled = false
+            sub.addItem(note)
+            it.submenu = sub
             menu.addItem(it)
         }
         menu.addItem(.separator())
@@ -1267,6 +1329,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             bubbleShownAt = Date()
         }
     }
+    @objc func openOutput(_ s: NSMenuItem) {
+        guard let path = s.representedObject as? String else { return }
+        // .output 은 연결된 앱이 없으므로 텍스트 편집기로 연다 (읽기만)
+        let editor = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+        NSWorkspace.shared.open([URL(fileURLWithPath: path)], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
+    }
+    @objc func dismissTask(_ s: NSMenuItem) {
+        guard let key = s.representedObject as? String else { return }
+        dismissed.insert(key)
+        tasks.removeAll { $0.key == key }
+        view.badge = tasks.count
+        refreshStatusTitle()
+    }
     @objc func pickSize(_ s: NSMenuItem) { try? Config.set("size", (s.representedObject as? Double) ?? 1); reload() }
     @objc func toggleVisible() {
         // 아이콘까지 꺼져 있으면 다시 켤 방법이 없어지므로 캐릭터를 끌 때 아이콘을 살린다
@@ -1342,14 +1417,18 @@ enum CLI {
         let run = t.running
         print(run.isEmpty ? "돌고 있는 백그라운드 작업 없음" : "돌고 있는 백그라운드 작업 \(run.count)개")
         for r in run {
-            print("  ● [\(r.kind)] \(r.label) — \(r.sessionName) · \(formatDuration(now.timeIntervalSince(r.startedAt)))")
+            let stale = (r.idle(now) ?? 0) > t.config.staleMinutes * 60
+            print("  \(stale ? "◌" : "●") [\(r.kind)] \(r.label) — \(r.sessionName) · \(formatDuration(now.timeIntervalSince(r.startedAt)))"
+                  + (stale ? " · 오래됨? (\(formatDuration(r.idle(now)!))째 출력 없음)" : ""))
+            if debug { print("      출력: \(r.outputFile ?? "모름")") }
         }
         let recent = t.watches.values.flatMap(\.history).sorted { $0.at > $1.at }.prefix(5)
         if !recent.isEmpty {
             print("\n최근 끝난 작업")
             for f in recent {
-                let mark = f.ok ? "✓" : f.failed ? "✗" : "·"
-                print("  \(mark) \(f.label) — \(f.sessionName) · \(formatDuration(now.timeIntervalSince(f.at))) 전" + (f.ok || f.failed ? "" : " (\(f.status))"))
+                let mark = f.ok ? "✓" : f.failed ? "✗" : f.stopped ? "■" : "·"
+                let tail = f.ok || f.failed ? "" : f.stopped ? " (멈춤)" : " (\(f.status))"
+                print("  \(mark) \(f.label) — \(f.sessionName) · \(formatDuration(now.timeIntervalSince(f.at))) 전" + tail)
             }
         }
         if debug {
