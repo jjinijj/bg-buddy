@@ -5,20 +5,19 @@ APP="$DIR/BgBuddy.app"
 EXE="$APP/Contents/MacOS/BgBuddy"
 AGENT="$HOME/Library/LaunchAgents/local.bgbuddy.plist"
 
-running() { pgrep -f "MacOS/BgBuddy$" >/dev/null 2>&1; }
-stop_wait() { pkill -f "MacOS/BgBuddy$" 2>/dev/null; for _ in $(seq 1 30); do running || return 0; sleep 0.1; done; }
+. "$DIR/lib.sh" 2>/dev/null || { echo "설치되어 있지 않습니다. 저장소에서 ./install.sh 를 실행하세요."; exit 1; }
 need_app() { [ -x "$EXE" ] || { echo "설치되어 있지 않습니다. 저장소에서 ./install.sh 를 실행하세요."; exit 1; }; }
 
 case "${1:-start}" in
   start|"")
     need_app
-    if running; then echo "이미 실행 중"; else open "$APP" && echo "실행됨"; fi ;;
+    if bb_running; then echo "이미 실행 중"; else bb_start && echo "실행됨"; fi ;;
   stop)
-    pkill -f "MacOS/BgBuddy$" && echo "종료됨" || echo "실행 중이 아님" ;;
+    if bb_running; then bb_stop && echo "종료됨" || echo "종료되지 않음"; else echo "실행 중이 아님"; fi ;;
   restart)
-    need_app; stop_wait; open "$APP"; echo "재시작됨" ;;
+    need_app; bb_stop; bb_start && echo "재시작됨" ;;
   status)
-    running && echo "실행 중 (pid $(pgrep -f 'MacOS/BgBuddy$' | head -1))" || echo "정지됨"
+    bb_running && echo "실행 중 (pid $(bb_pid))" || echo "정지됨"
     [ -f "$AGENT" ] && echo "로그인 자동 실행: 켜짐" || echo "로그인 자동 실행: 꺼짐" ;;
   tasks|ls)
     need_app; shift; "$EXE" --tasks "$@" ;;
@@ -26,7 +25,7 @@ case "${1:-start}" in
     need_app; "$EXE" --doctor ;;
   test|poke)
     need_app
-    running || { echo "실행 중이 아닙니다. buddy start 먼저"; exit 1; }
+    bb_running || { echo "실행 중이 아닙니다. buddy start 먼저"; exit 1; }
     "$EXE" --poke "${2:-done}"
     echo "보냄: ${2:-done}  (done | failed | many | working | extra)" ;;
   show)
@@ -50,11 +49,11 @@ case "${1:-start}" in
   open|folder)
     open "$DIR/characters" ;;
   rebuild)
-    bash "$DIR/build.sh" "$DIR" && { stop_wait; open "$APP"; echo "재빌드 후 실행됨"; } ;;
+    bb_stop; bash "$DIR/build.sh" "$DIR" && bb_start && echo "재빌드 후 실행됨" ;;
   login-on)
     launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null; echo "로그인 자동 실행 켬" ;;
   login-off)
-    launchctl bootout "gui/$(id -u)/local.bgbuddy" 2>/dev/null; echo "로그인 자동 실행 끔 (지금 실행 중인 앱도 종료됨)" ;;
+    launchctl bootout "gui/$(id -u)/local.bgbuddy" 2>/dev/null; echo "로그인 자동 실행 끔 (로그인 때 띄운 앱이면 지금 함께 종료됨)" ;;
   help|-h|--help|*)
     cat <<USAGE
 buddy                    캐릭터 띄우기

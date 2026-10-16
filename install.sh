@@ -11,9 +11,15 @@ command -v swiftc >/dev/null || {
   echo "swiftc 가 없습니다. Xcode Command Line Tools 를 먼저 설치하세요:"
   echo "  xcode-select --install"; exit 1; }
 
+. "$REPO/lib.sh"
+
+# 이미 떠 있는 앱은 먼저 끈다 — 로그인 자동 실행으로 뜬 것은 launchd 라벨로, 직접 연 것은 PID 파일로
+launchctl bootout "gui/$(id -u)/local.bgbuddy" 2>/dev/null || true
+bb_stop || echo "    ※ 실행 중인 앱이 끝나지 않았습니다. 설치 후 buddy restart 를 실행하세요"
+
 echo "==> 파일 설치: $DEST"
 mkdir -p "$DEST/characters" "$BIN"
-cp "$REPO/src/BgBuddy.swift" "$REPO/build.sh" "$DEST/"; chmod +x "$DEST/build.sh"
+cp "$REPO/src/BgBuddy.swift" "$REPO/build.sh" "$REPO/lib.sh" "$REPO/assets/AppIcon.icns" "$DEST/"; chmod +x "$DEST/build.sh"
 # 저장소의 캐릭터만 덮어쓴다. 직접 넣은 캐릭터 폴더는 건드리지 않는다.
 cp -R "$REPO/characters/." "$DEST/characters/"
 if [ ! -f "$DEST/config.json" ]; then
@@ -45,13 +51,10 @@ cat > "$AGENT" <<PLIST
   <key>KeepAlive</key><false/>
 </dict></plist>
 PLIST
-launchctl bootout "gui/$(id -u)/local.bgbuddy" 2>/dev/null || true
+# 등록하면 RunAtLoad 로 바로 뜬다. 안 떴을 때만 직접 연다
 launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null || true
-
-# 자동 실행 등록이 띄운 것까지 모두 끈 뒤, 완전히 꺼진 걸 확인하고 하나만 연다
-pkill -f "MacOS/BgBuddy$" 2>/dev/null || true
-for _ in $(seq 1 30); do pgrep -f "MacOS/BgBuddy$" >/dev/null || break; sleep 0.1; done
-open "$APP"
+for _ in $(seq 1 30); do bb_running && break; sleep 0.1; done
+bb_start || echo "    ※ 앱이 뜨지 않았습니다. buddy start 로 다시 시도하세요"
 echo
 echo "설치 완료. 캐릭터가 화면 오른쪽 아래에 떠 있습니다."
 echo "  buddy test     말풍선 시험"

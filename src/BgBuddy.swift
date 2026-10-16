@@ -31,6 +31,8 @@ enum Paths {
     }()
     static var config: URL { root.appendingPathComponent("config.json") }
     static var characters: URL { root.appendingPathComponent("characters") }
+    // 스크립트가 패턴 매칭 없이 정확히 이 앱만 끌 수 있도록 실행 중인 PID 를 남긴다
+    static var pidFile: URL { root.appendingPathComponent(".bgbuddy.pid") }
 }
 
 struct Config {
@@ -948,6 +950,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .filter { $0.processIdentifier != me.processIdentifier && !$0.isTerminated }
             .contains { ($0.launchDate ?? .distantPast) < (me.launchDate ?? .distantFuture) }
         if older { NSApp.terminate(nil); return }
+        try? "\(getpid())\n".write(to: Paths.pidFile, atomically: true, encoding: .utf8)
         tracker = Tracker(config: config)
         view = BuddyView(character: loadCharacter())
         panel = NSPanel(contentRect: NSRect(origin: .zero, size: view.frame.size),
@@ -974,10 +977,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dnc.addObserver(forName: Notification.Name("local.bgbuddy.reload"), object: nil, queue: .main) { [weak self] _ in
             self?.reload()
         }
+        // buddy stop·설치 스크립트가 보내는 종료 요청 — 프로세스를 죽이지 않고 스스로 끝낸다
+        dnc.addObserver(forName: Notification.Name("local.bgbuddy.quit"), object: nil, queue: .main) { _ in
+            NSApp.terminate(nil)
+        }
 
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.poll() }
         Timer.scheduledTimer(withTimeInterval: 1.0 / 24, repeats: true) { [weak self] _ in self?.tick() }
         poll()
+    }
+
+    func applicationWillTerminate(_ n: Notification) {
+        // 내가 쓴 PID 파일일 때만 지운다 (양보하고 끝나는 두 번째 인스턴스가 지우지 않게)
+        if let s = try? String(contentsOf: Paths.pidFile, encoding: .utf8),
+           Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)) == getpid() {
+            try? FileManager.default.removeItem(at: Paths.pidFile)
+        }
     }
 
     func loadCharacter() -> Character {
@@ -1297,6 +1312,8 @@ enum CLI {
                 post("local.bgbuddy.poke", args.count > 1 ? args[1] : "done"); return 0
             case "--reload":
                 post("local.bgbuddy.reload", nil); return 0
+            case "--quit":
+                post("local.bgbuddy.quit", nil); return 0
             case "--set":
                 guard args.count > 2 else { throw BuddyError("사용법: --set <키> <값>") }
                 let v = args[2]
@@ -1305,7 +1322,7 @@ enum CLI {
                 post("local.bgbuddy.reload", nil)
                 return 0
             default:
-                print("사용법: BgBuddy [--tasks [--debug] | --doctor | --characters | --check-character 이름 | --import 이미지 이름 | --poke 종류 | --reload | --set 키 값]")
+                print("사용법: BgBuddy [--tasks [--debug] | --doctor | --characters | --check-character 이름 | --import 이미지 이름 | --poke 종류 | --reload | --quit | --set 키 값]")
                 return 2
             }
         } catch {
