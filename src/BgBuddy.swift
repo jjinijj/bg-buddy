@@ -627,6 +627,8 @@ struct LogEvent {
                 let dur = (extra["dur"] as? Int).map { " · " + formatDuration(Double($0)) } ?? ""
                 return (name, "\(session) \(s("label"))\(dur)")
             case "message": return ("메시지", "\(session) → \(s("to"))  “\(s("text"))”")
+            case "stuck": return ("오래 멈춤", "\(session) · \(s("tool")) \((extra["min"] as? Int) ?? 0)분째 결과 없음 (승인 대기일 수 있음)")
+            case "error": return ("오류", "\(session) · API 재시도 \((extra["attempt"] as? Int) ?? 0)회째")
             default: return (type, session)
             }
         }()
@@ -688,6 +690,15 @@ struct LiveSession {
     var statusSince: Double = 0   // 지금 상태(busy/idle)가 된 시각 (ms) — 얼마나 오래 쉬었는지
     var kind = ""                 // interactive / bg (claude --bg 로 띄운 백그라운드 세션)
     var question = false     // AskUserQuestion 에 아직 답이 없음
+    var pendingTool = ""     // 결과가 안 온 도구 중 가장 오래된 것 (지금 작업 구간 안에서)
+    var pendingSince: Double = 0   // 그 도구를 부른 시각 (epoch 초). 0 이면 없음
+    var apiError = false     // API 재시도를 반복하는 중
+
+    // 느림·오래 멈춤: 세션이 작업 중일 때 도구 하나가 결과 없이 걸린 시간 (usage-hud 하한과 같은 고정값)
+    static let graceSeconds = 90.0, slowSeconds = 300.0, stuckSeconds = 1800.0
+    func pendingFor(_ now: Date = Date()) -> Double { busy && pendingSince > 0 ? now.timeIntervalSince1970 - pendingSince : 0 }
+    var slow: Bool { pendingFor() > LiveSession.slowSeconds }
+    var stuck: Bool { pendingFor() > LiveSession.stuckSeconds }
 }
 
 final class SessionWatch {
@@ -698,7 +709,8 @@ final class SessionWatch {
     var offset: UInt64 = 0
     var partial = Data()
     var primed = false               // 첫 읽기(과거 기록)가 끝났는지. 과거 알림으로는 말풍선을 띄우지 않는다
-    var tools: [String: (name: String, label: String)] = [:]
+    var tools: [String: (name: String, label: String, startedAt: Date)] = [:]
+    var lastError: (attempt: Int, at: Date, retryIn: Double)?   // 마지막 api_error
     var running: [String: BgTask] = [:]
     var ended: Set<String> = []
     var history: [Finished] = []
@@ -730,6 +742,7 @@ final class Tracker {
     private var pendingStartSeen = false   // 첫 poll 에서 이미 퇴근 상태인 세션은 기록하지 않는다
     private var knownSessions: [String: String] = [:]
     private var awaySessions: Set<String> = []
+    private var stuckLogged: Set<String> = []
     private var recentMessages: [String: Date] = [:]   // 같은 메시지가 몇 초 안에 반복되면 한 번으로
     func drainLog() -> [LogEvent] { defer { pendingLog = [] }; return pendingLog }
     private func log(_ type: String, session: String, sid: String, _ extra: [String: Any] = [:], at: Date = Date()) {
@@ -749,7 +762,31 @@ final class Tracker {
         if Date().timeIntervalSince(lastRegistryScan) > 3 { scanRegistry() }
         var out: [Finished] = []
         for w in watches.values { out += read(w) }
-        live = liveInfo.map { var l = $0; l.question = !(watches[l.id]?.asks.isEmpty ?? true); return l }
+        let nowD = Date()
+        live = liveInfo.map {
+            var l = $0
+            guard let w = watches[l.id] else { return l }
+            l.question = !w.asks.isEmpty
+            // 지금 작업 구간(statusSince) 이후에 부른 도구만 본다 — 예전에 중단돼 결과가 영영 안 오는 도구가
+            // 기록에 남아 있어도 "멈춤"으로 보이지 않게. 질문 대기는 사람을 기다리는 것이라 뺀다
+            let since = l.statusSince / 1000 - 5
+            if let oldest = w.tools.filter({ $0.key != "" && !w.asks.contains($0.key) && $0.value.name != "AskUserQuestion"
+                                              && $0.value.startedAt.timeIntervalSince1970 >= since })
+                                   .min(by: { $0.value.startedAt < $1.value.startedAt }) {
+                l.pendingTool = oldest.value.name
+                l.pendingSince = oldest.value.startedAt.timeIntervalSince1970
+            }
+            if let e = w.lastError, e.attempt >= 2, nowD.timeIntervalSince(e.at) < max(120, e.retryIn + 60) { l.apiError = l.busy }
+            // 오래된 도구 기록은 정리 (하루 넘게 결과가 없으면 중단된 것)
+            if w.tools.count > 50 { w.tools = w.tools.filter { nowD.timeIntervalSince($0.value.startedAt) < 86400 } }
+            return l
+        }
+        for l in live where l.stuck && !stuckLogged.contains(l.id) {
+            stuckLogged.insert(l.id)
+            // 앱을 켠 순간 이미 멈춰 있던 세션은 기록하지 않는다 (과거를 채우지 않는다)
+            if pendingStartSeen { log("stuck", session: l.name, sid: l.id, ["tool": l.pendingTool, "min": Int(l.pendingFor(nowD) / 60)]) }
+        }
+        stuckLogged = stuckLogged.filter { id in live.contains { $0.id == id && $0.stuck } }
         let nowS = Date().timeIntervalSince1970
         for l in live {
             let tasks = watches[l.id]?.running.count ?? 0
@@ -860,17 +897,33 @@ final class Tracker {
 
     private static let pNote = Data("<task-notification>".utf8)
     private static let pMsg = Data("<cross-session-message".utf8)
+    private static let pApiError = Data("\"api_error\"".utf8)
+    // 결과 줄: toolUseResult 키가 없는 결과(MCP 도구·도구 검색 등)도 있어서 tool_result 로도 골라야 도구 기록이 지워진다
+    private static let pToolResult = Data("\"tool_result\"".utf8)
     private static let pToolUse = Data("\"tool_use\"".utf8)
     private static let pResult = Data("\"toolUseResult\"".utf8)
 
     private func process(_ line: Data, _ w: SessionWatch, live: Bool) -> [Finished] {
         let hasNote = line.range(of: Self.pNote) != nil
         let hasUse = line.range(of: Self.pToolUse) != nil
-        let hasResult = line.range(of: Self.pResult) != nil
+        let hasResult = line.range(of: Self.pResult) != nil || line.range(of: Self.pToolResult) != nil
         let hasMsg = live && line.range(of: Self.pMsg) != nil
-        guard hasNote || hasUse || hasResult || hasMsg,
+        let hasErr = line.range(of: Self.pApiError) != nil
+        guard hasNote || hasUse || hasResult || hasMsg || hasErr,
               let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return [] }
+        // 서브에이전트의 줄은 메인 세션 상태에 섞지 않는다
+        if (j["isSidechain"] as? Bool) == true { return [] }
+        // 실제 대화 줄만 도구 호출·결과·알림으로 읽는다. api-request-blob 같은 줄에는 API 로 보낸 대화 내역이
+        // 통째로 들어 있어, 이미 끝난 도구 호출이 다시 나온다 (끝난 도구가 다시 등록되던 원인)
+        let lineType = (j["type"] as? String) ?? ""
+        let isTurn = lineType == "assistant" || lineType == "user"
         let ts = Self.date(j["timestamp"] as? String)
+        // API 오류: type=system, subtype=api_error. 재시도 횟수를 직접 읽는다
+        if hasErr, (j["subtype"] as? String) == "api_error" {
+            let attempt = (j["retryAttempt"] as? Int) ?? 1
+            w.lastError = (attempt, ts ?? Date(), ((j["retryInMs"] as? Double) ?? 0) / 1000)
+            if live && attempt == 2 { log("error", session: w.name, sid: w.sessionId, ["attempt": attempt], at: ts ?? Date()) }
+        }
         var out: [Finished] = []
 
         if hasNote {
@@ -878,7 +931,7 @@ final class Tracker {
             var texts: [String] = []
             if (j["type"] as? String) == "queue-operation" {
                 if (j["operation"] as? String) == "enqueue", let s = j["content"] as? String { texts.append(s) }
-            } else if let m = j["message"] as? [String: Any] {
+            } else if isTurn, let m = j["message"] as? [String: Any] {
                 if let s = m["content"] as? String { texts.append(s) }
                 for b in (m["content"] as? [[String: Any]]) ?? [] where (b["type"] as? String) == "text" {
                     if let s = b["text"] as? String { texts.append(s) }
@@ -919,15 +972,20 @@ final class Tracker {
             if recentMessages.count > 200 { recentMessages = recentMessages.filter { at.timeIntervalSince($0.value) < 300 } }
         }
 
-        let blocks = ((j["message"] as? [String: Any])?["content"] as? [[String: Any]]) ?? []
+        let blocks = isTurn ? (((j["message"] as? [String: Any])?["content"] as? [[String: Any]]) ?? []) : []
         for b in blocks {
             switch b["type"] as? String {
-            case "tool_use": toolUse(b, w, live: live, ts: ts)
+            case "tool_use":
+                toolUse(b, w, live: live, ts: ts)
+                w.lastError = nil   // 도구를 다시 부르기 시작했으면 오류에서 벗어난 것
             case "tool_result":
-                if let id = b["tool_use_id"] as? String, w.asks.remove(id) != nil, live {
+                guard let id = b["tool_use_id"] as? String else { break }
+                if w.asks.remove(id) != nil, live {
                     log("answer", session: w.name, sid: w.sessionId, at: ts ?? Date())
                 }
-                if let r = j["toolUseResult"] as? [String: Any] { toolResult(b, r, ts: ts, w, sessionId: w.sessionId, live: live) }
+                // 결과가 오면 무조건 지운다 — toolUseResult 가 없는 결과도 있어서, 안 지우면 끝난 도구가 영원히 "멈춤"으로 보인다
+                let tool = w.tools.removeValue(forKey: id)
+                if let r = j["toolUseResult"] as? [String: Any] { toolResult(b, r, tool: tool, ts: ts, w, sessionId: w.sessionId, live: live) }
             default: break
             }
         }
@@ -955,12 +1013,12 @@ final class Tracker {
         }
         var label = (input["description"] as? String) ?? ""
         if label.isEmpty, let c = input["command"] as? String { label = String(c.prefix(40)) }
-        w.tools[id] = (name, label.isEmpty ? name : label)
+        w.tools[id] = (name, label.isEmpty ? name : label, ts ?? Date())
     }
 
-    private func toolResult(_ b: [String: Any], _ r: [String: Any], ts: Date?, _ w: SessionWatch, sessionId: String, live: Bool = false) {
+    private func toolResult(_ b: [String: Any], _ r: [String: Any], tool: (name: String, label: String, startedAt: Date)?,
+                            ts: Date?, _ w: SessionWatch, sessionId: String, live: Bool = false) {
         guard let id = b["tool_use_id"] as? String else { return }
-        let tool = w.tools.removeValue(forKey: id)
         guard !w.ended.contains(id), w.running[id] == nil else { return }
         let name = tool?.name ?? ""
         var taskId: String?
@@ -1169,12 +1227,27 @@ final class Seat {
     var flash: (kind: String, until: Date)?     // cheer·sad 를 잠깐
     var walkIn: Date?, walkOut: Date?           // 출근(또는 복귀) / 세션 종료로 퇴장
     var away = false                            // 오래 쉬어서 퇴근함 — 빈 책상만 남음
+    var pendingTool = "", pendingSecs = 0.0     // 결과 없이 걸리고 있는 도구와 경과 시간
+    var errored = false
+    var stuck: Bool { busy && pendingSecs > LiveSession.stuckSeconds }
+    var slow: Bool { busy && pendingSecs > LiveSession.slowSeconds && !stuck }
     var leaving: Date?                          // 퇴근하며 걸어 나가는 중 (책상은 남김)
     var idleMinutes = 0.0
     init(id: String, name: String, variant: Int, startedAt: Double) {
         self.id = id; self.name = name; self.variant = variant; self.startedAt = startedAt
     }
-    var priority: Int { question ? 0 : busy ? 1 : away ? 3 : 2 }
+    // 질문 대기 > 오래 멈춤 > 오류 > 느림 > 작업 중 > 쉬는 중 > 퇴근
+    var priority: Int { question ? 0 : stuck ? 1 : errored ? 2 : slow ? 3 : busy ? 4 : away ? 6 : 5 }
+    // 사람이 읽는 상태 한 줄
+    var stateText: String {
+        if question { return "질문에 답을 기다리는 중" }
+        if stuck { return "오래 멈춤 (승인 대기일 수 있음) · \(pendingTool) \(formatDuration(pendingSecs))째" }
+        if errored { return "API 오류 — 재시도 중" }
+        if slow { return "느림 · \(pendingTool) \(formatDuration(pendingSecs))째" }
+        if busy { return "작업 중" }
+        if away { return "퇴근 (\(formatDuration(idleMinutes * 60))째 쉬는 중)" }
+        return "쉬는 중"
+    }
 }
 
 final class OfficeView: NSView {
@@ -1231,6 +1304,7 @@ final class OfficeView: NSView {
                 return s
             }()
             s.name = l.name; s.busy = l.busy; s.question = l.question; s.walkOut = nil
+            s.pendingTool = l.pendingTool; s.pendingSecs = l.pendingFor(now); s.errored = l.apiError
             let mine = tasks.filter { $0.sessionId == l.id }
             s.tasks = mine.count
             s.agents = mine.filter { $0.kind == "agent" }.count
@@ -1284,9 +1358,7 @@ final class OfficeView: NSView {
     }
 
     func showInfo(_ s: Seat) {
-        let state = s.question ? "질문에 답을 기다리는 중" : s.busy ? "작업 중"
-            : s.away ? "퇴근 (\(formatDuration(s.idleMinutes * 60))째 쉬는 중)" : "쉬는 중"
-        var body = state
+        var body = s.stateText
         if s.tasks > 0 { body += " · 백그라운드 \(s.tasks)개" }
         current = (s.id, Bubble(title: s.name, body: body, sub: "", seconds: 4), Date())
     }
@@ -1376,7 +1448,9 @@ final class OfficeView: NSView {
                 continue
             }
             let key = s.flash?.kind ?? (s.question ? "raise" : s.busy ? "typing" : "sleep")
-            let img = v.frames[key == "typing" ? cycle("typing", Date(timeIntervalSince1970: 0)) : pack.frames(key)[0]]
+            // 오래 멈춤·오류면 타이핑을 멈춘 채 첫 프레임으로 (움직임이 멈춘 것이 상태를 말해 준다)
+            let frozen = key == "typing" && (s.stuck || s.errored)
+            let img = v.frames[key == "typing" && !frozen ? cycle("typing", Date(timeIntervalSince1970: 0)) : pack.frames(key)[0]]
             let r = frameRect(s, x: x, image: img)
             ctx.draw(img, in: r)
             seatRects.append((s, r))
@@ -1386,7 +1460,11 @@ final class OfficeView: NSView {
                 let ar = frameRect(s, x: x, image: st, scale: 0.62)
                 ctx.draw(st, in: NSRect(x: r.maxX - ar.width * 0.55, y: floorY, width: ar.width, height: ar.height))
             }
-            if s.question { drawBadge("!", center: NSPoint(x: r.maxX - 8, y: r.maxY - 6), color: NSColor(red: 1, green: 0.42, blue: 0.29, alpha: 1)) }
+            let badgeAt = NSPoint(x: r.maxX - 8, y: r.maxY - 6)
+            if s.question { drawBadge("!", center: badgeAt, color: NSColor(red: 1, green: 0.42, blue: 0.29, alpha: 1)) }
+            else if s.stuck { drawBadge("?", center: badgeAt, color: NSColor(red: 0.86, green: 0.2, blue: 0.2, alpha: 1)) }
+            else if s.errored { drawBadge("×", center: badgeAt, color: NSColor(red: 0.86, green: 0.2, blue: 0.2, alpha: 1)) }
+            else if s.slow { drawBadge("…", center: badgeAt, color: NSColor(red: 0.96, green: 0.72, blue: 0.1, alpha: 1)) }
             if s.tasks > 0 { drawBadge("\(s.tasks)", center: NSPoint(x: r.minX + 7, y: r.minY + r.height * 0.42), color: NSColor(red: 0.27, green: 0.5, blue: 0.95, alpha: 1), radius: 6) }
         }
         if overflow > 0 {
@@ -1409,7 +1487,7 @@ final class OfficeView: NSView {
 
     func tooltip(at p: NSPoint) -> String? {
         guard let s = seat(at: p) else { return nil }
-        return s.name + (s.question ? " · 질문 대기" : s.busy ? " · 작업 중" : s.away ? " · 퇴근" : " · 쉬는 중") + (s.tasks > 0 ? " · 백그라운드 \(s.tasks)개" : "")
+        return s.name + " · " + s.stateText + (s.tasks > 0 ? " · 백그라운드 \(s.tasks)개" : "")
     }
 
     private var dragStart: NSPoint?, originStart: NSPoint?, dragged = false
@@ -2196,7 +2274,7 @@ enum CLI {
                 return 0
             case "--render-office":
                 // 확인용: 지금 세션 상태로 사무실 화면을 PNG 로 그린다 (Retina 2배)
-                guard args.count > 1 else { throw BuddyError("사용법: --render-office <출력.png> [done|failed|away|demo]") }
+                guard args.count > 1 else { throw BuddyError("사용법: --render-office <출력.png> [done|failed|away|demo|states]") }
                 let c = Config.load()
                 let v = OfficeView(pack: try OfficePack.load(size: c.size))
                 let t = Tracker(config: c); _ = t.poll()
@@ -2209,7 +2287,18 @@ enum CLI {
                                     statusSince: (Date().timeIntervalSince1970 - 3600) * 1000)
                     }
                 }
-                if args.count > 2 && args[2] == "demo" {
+                if args.count > 2 && args[2] == "states" {
+                    // 시험: 질문 대기 / 오래 멈춤 / 오류 / 느림 네 상태를 한 화면에
+                    let now = Date(), ms = { (ago: Double) in (now.timeIntervalSince1970 - ago) * 1000 }
+                    var a = LiveSession(id: "s-a", name: "질문", busy: false, startedAt: ms(4000), statusSince: ms(60)); a.question = true
+                    var b = LiveSession(id: "s-b", name: "멈춤", busy: true, startedAt: ms(3900), statusSince: ms(2500))
+                    b.pendingTool = "Bash"; b.pendingSince = now.timeIntervalSince1970 - 2100
+                    var c = LiveSession(id: "s-c", name: "오류", busy: true, startedAt: ms(3800), statusSince: ms(200)); c.apiError = true
+                    var d = LiveSession(id: "s-d", name: "느림", busy: true, startedAt: ms(3700), statusSince: ms(500))
+                    d.pendingTool = "Bash"; d.pendingSince = now.timeIntervalSince1970 - 420
+                    v.update(live: [a, b, c, d], tasks: [], events: [], visible: true)
+                    for st in v.shown { print("  \(st.name): \(st.stateText)") }
+                } else if args.count > 2 && args[2] == "demo" {
                     // README 용: 실제 세션 이름이 들어가지 않게 가짜 세션으로 그린다
                     let now = Date(), ms = { (ago: Double) in (now.timeIntervalSince1970 - ago) * 1000 }
                     let demo = [
@@ -2241,7 +2330,7 @@ enum CLI {
                 NSGraphicsContext.restoreGraphicsState()
                 try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: args[1]))
                 print("세션 \(v.seats.count)개 → 책상 \(v.shown.count)개" + (v.overflow > 0 ? " (+\(v.overflow))" : "") + " · 창 \(Int(v.bounds.width))×\(Int(v.bounds.height))pt")
-                for st in v.shown { print("  \(st.name): " + (st.question ? "질문 대기" : st.busy ? "작업 중" : st.away ? "퇴근 (\(Int(st.idleMinutes))분째 쉼)" : "쉬는 중 (\(Int(st.idleMinutes))분째)") + (st.tasks > 0 ? " · 백그라운드 \(st.tasks)" : "")) }
+                for st in v.shown { print("  \(st.name): " + st.stateText + (st.tasks > 0 ? " · 백그라운드 \(st.tasks)" : "")) }
                 return 0
             case "--set":
                 guard args.count > 2 else { throw BuddyError("사용법: --set <키> <값>") }
@@ -2288,7 +2377,10 @@ enum CLI {
         if debug {
             print("\n세션별")
             for w in t.watches.values.sorted(by: { $0.name < $1.name }) {
-                print("  \(w.name) [\(w.version)] 시작 \(w.starts) · 완료 알림 \(w.notes) · 모르는 알림 \(w.unknownNotes)")
+                print("  \(w.name) [\(w.version)] 시작 \(w.starts) · 완료 알림 \(w.notes) · 모르는 알림 \(w.unknownNotes) · 결과 대기 도구 \(w.tools.count)개")
+                if let l = t.live.first(where: { $0.id == w.sessionId }), l.pendingSince > 0 {
+                    print("    가장 오래 기다리는 도구: \(l.pendingTool) \(formatDuration(l.pendingFor()))" + (l.slow ? " (느림)" : "") + (l.stuck ? " (오래 멈춤)" : ""))
+                }
                 print("    \(w.url.path)")
             }
         }
