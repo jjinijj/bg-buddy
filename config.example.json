@@ -1,4 +1,6 @@
 {
+  "mode": "buddy",
+  "leave_after_minutes": 30,
   "character": "default",
   "visible": true,
   "menu_bar_icon": true,

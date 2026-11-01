@@ -44,6 +44,8 @@ struct Config {
     var visible = true          // 캐릭터 보이기 (끄면 말풍선도 안 뜨고 메뉴 막대에만 표시)
     var menuBarIcon = true
     var size = 1.0              // 캐릭터 기본 크기에 곱하는 배율
+    var mode = "buddy"          // buddy: 캐릭터 하나 / office: 세션마다 책상
+    var leaveAfterMinutes = 30.0 // 사무실 모드: 이만큼 쉬면 퇴근(빈 책상)
     var ignoreKinds: Set<String> = []
     var maxTaskHours = 12.0
     var staleMinutes = 30.0     // 출력이 이만큼 없으면 "오래됨?" 표시 (목록에서 빼지는 않음)
@@ -66,6 +68,8 @@ struct Config {
         if let v = j["visible"] as? Bool { c.visible = v }
         if let v = j["menu_bar_icon"] as? Bool { c.menuBarIcon = v }
         if let v = j["size"] as? Double, v > 0 { c.size = v }
+        if let v = j["mode"] as? String, ["buddy", "office"].contains(v) { c.mode = v }
+        if let v = j["leave_after_minutes"] as? Double, v > 0 { c.leaveAfterMinutes = v }
         if let v = j["ignore_kinds"] as? [String] { c.ignoreKinds = Set(v.map { $0.lowercased() }) }
         if let v = j["max_task_hours"] as? Double, v > 0 { c.maxTaskHours = v }
         if let v = j["stale_minutes"] as? Double, v > 0 { c.staleMinutes = v }
@@ -276,6 +280,52 @@ enum Importer {
             }.min { abs(gbox[$0].cx - b.cx) + abs(gbox[$0].cy - b.cy) < abs(gbox[$1].cx - b.cx) + abs(gbox[$1].cy - b.cy) }
             if let g = near { groupOf[c] = g; gbox[g].add(b) }
         }
+
+        // 붙은 프레임 자르기: 머리카락·팔이 옆 칸에 닿으면 두세 프레임이 한 덩어리로 잡힌다.
+        // 다른 프레임보다 1.6배 넘게 넓으면 폭 비율로 몇 개가 붙었는지 정하고,
+        // 예상 경계 근처에서 그림이 가장 적은 세로줄을 잘라 나눈다.
+        var cuts: [Int: [Int]] = [:]          // 원래 덩어리 → 자를 x 좌표들
+        var partOf: [Int: [Int]] = [:]        // 원래 덩어리 → 조각별 새 덩어리 번호
+        let medianW = gbox.map(\.w).sorted()[gbox.count / 2]
+        for g in gbox.indices where Double(gbox[g].w) > Double(medianW) * 1.6 {
+            let b = gbox[g]
+            let k = max(2, Int((Double(b.w) / Double(medianW)).rounded()))
+            var col = [Int](repeating: 0, count: b.w)
+            for y in b.minY...b.maxY { for x in b.minX...b.maxX {
+                let l = label[y * W + x]
+                if l >= 0 && groupOf[Int(l)] == g { col[x - b.minX] += 1 }
+            } }
+            var xs: [Int] = []
+            for j in 1..<k {
+                let center = b.w * j / k, r = b.w / (k * 3)
+                let lo = max(1, center - r), hi = min(b.w - 2, center + r)
+                let best = (lo...hi).min { col[$0] < col[$1] } ?? center
+                xs.append(b.minX + best)
+            }
+            cuts[g] = xs
+            var ids = [g]
+            for _ in 1..<k { ids.append(gbox.count); gbox.append(b) }
+            partOf[g] = ids
+        }
+        // 덩어리 번호: 잘린 덩어리는 x 위치로 조각을 고른다
+        func groupAt(_ i: Int) -> Int {
+            guard label[i] >= 0 else { return -1 }
+            let g = groupOf[Int(label[i])]
+            guard g >= 0, let xs = cuts[g], let ids = partOf[g] else { return g }
+            let x = i % W
+            return ids[xs.filter { x >= $0 }.count]
+        }
+        if !cuts.isEmpty {
+            // 조각마다 실제 그림이 있는 범위로 상자를 다시 잰다
+            var nb: [Box?] = Array(repeating: nil, count: gbox.count)
+            for i in 0..<N {
+                let g = groupAt(i)
+                guard g >= 0, partOf.values.contains(where: { $0.contains(g) }) else { continue }
+                let x = i % W, y = i / W
+                if nb[g] == nil { nb[g] = Box(minX: x, minY: y, maxX: x, maxY: y) } else { nb[g]!.add(Box(minX: x, minY: y, maxX: x, maxY: y)) }
+            }
+            for (id, box) in nb.enumerated() { if let bx = box { gbox[id] = bx } }
+        }
         // 줄 단위로 위→아래, 줄 안에서 왼→오른
         let avgH = Double(gbox.map(\.h).reduce(0, +)) / Double(gbox.count)
         var order: [Int] = [], rowStart: Double? = nil, row: [Int] = []
@@ -285,7 +335,7 @@ enum Importer {
             row.append(g)
         }
         order += row.sorted { gbox[$0].minX < gbox[$1].minX }
-        func member(_ i: Int, _ g: Int) -> Bool { label[i] >= 0 && groupOf[Int(label[i])] == g }
+        func member(_ i: Int, _ g: Int) -> Bool { groupAt(i) == g }
 
         // 3) 팔레트 — 압축 번짐으로 생긴 중간색은 가까운 대표색으로 흡수한다
         var samples: [SIMD3<Float>] = []
@@ -432,7 +482,8 @@ enum Importer {
         ]
         let jd = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         try jd.write(to: dir.appendingPathComponent("character.json"))
-        let note = isPixel ? String(format: "한 칸 %.2fpx → ", block) : "격자 없음(원본 해상도 유지) · "
+        let split = cuts.isEmpty ? "" : "붙은 프레임 \(cuts.count)곳을 나눔 · "
+        let note = split + (isPixel ? String(format: "한 칸 %.2fpx → ", block) : "격자 없음(원본 해상도 유지) · ")
         return "프레임 \(n)개 · \(note)칸 크기 \(cw)×\(ch) · 팔레트 \(pal.count)색\n저장: \(dir.path)"
     }
 
@@ -496,6 +547,7 @@ enum Importer {
 
 struct BgTask {
     let key: String          // tool_use id
+    var sessionId = ""
     let taskId: String
     let kind: String         // bash / agent / monitor / …
     let label: String
@@ -512,6 +564,7 @@ struct BgTask {
 }
 
 struct Finished {
+    var sessionId = ""
     let label: String
     let kind: String
     let status: String       // completed / failed / killed …
@@ -522,6 +575,16 @@ struct Finished {
     var failed: Bool { status.hasPrefix("fail") || status == "error" }
     // 신호를 받고 끝난 작업(사용자나 Claude 가 직접 끈 서버 등). 오류로 보지 않는다
     var stopped: Bool { status == "stopped" || status == "killed" }
+}
+
+// 살아 있는 세션 하나 (사무실 모드의 책상 하나)
+struct LiveSession {
+    let id: String
+    let name: String
+    let busy: Bool           // sessions/<pid>.json 의 status == "busy"
+    let startedAt: Double
+    var statusSince: Double = 0   // 지금 상태(busy/idle)가 된 시각 (ms) — 얼마나 오래 쉬었는지
+    var question = false     // AskUserQuestion 에 아직 답이 없음
 }
 
 final class SessionWatch {
@@ -536,6 +599,7 @@ final class SessionWatch {
     var running: [String: BgTask] = [:]
     var ended: Set<String> = []
     var history: [Finished] = []
+    var asks: Set<String> = []       // 답을 기다리는 AskUserQuestion 의 tool_use id
     var starts = 0, notes = 0, unknownNotes = 0
 
     init(sessionId: String, url: URL, name: String, version: String) {
@@ -544,7 +608,7 @@ final class SessionWatch {
 
     func reset() {
         offset = 0; partial = Data(); primed = false
-        tools = [:]; running = [:]; ended = []; history = []
+        tools = [:]; running = [:]; ended = []; history = []; asks = []
     }
 }
 
@@ -552,8 +616,10 @@ final class Tracker {
     var config: Config
     private(set) var watches: [String: SessionWatch] = [:]
     private(set) var liveSessions = 0
+    private(set) var live: [LiveSession] = []
     private(set) var versions: [String] = []
     private var lastRegistryScan = Date.distantPast
+    private var liveInfo: [LiveSession] = []
 
     init(config: Config) { self.config = config }
 
@@ -568,6 +634,7 @@ final class Tracker {
         if Date().timeIntervalSince(lastRegistryScan) > 3 { scanRegistry() }
         var out: [Finished] = []
         for w in watches.values { out += read(w) }
+        live = liveInfo.map { var l = $0; l.question = !(watches[l.id]?.asks.isEmpty ?? true); return l }
         let cutoff = Date().addingTimeInterval(-config.maxTaskHours * 3600)
         for w in watches.values {
             w.running = w.running.filter { $0.value.startedAt > cutoff }
@@ -584,19 +651,22 @@ final class Tracker {
     func scanRegistry() {
         lastRegistryScan = Date()
         let dir = config.claudeRoot.appendingPathComponent("sessions")
-        var live: [String: (name: String, version: String)] = [:]
+        var live: [String: (name: String, version: String, busy: Bool, startedAt: Double, since: Double)] = [:]
         for f in (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [] where f.hasSuffix(".json") {
             guard let d = try? Data(contentsOf: dir.appendingPathComponent(f)),
                   let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
                   let pid = (j["pid"] as? NSNumber)?.int32Value, let sid = j["sessionId"] as? String,
                   kill(pid, 0) == 0 || errno == EPERM else { continue }
             let cwdName = (j["cwd"] as? String).map { ($0 as NSString).lastPathComponent } ?? "세션"
-            live[sid] = ((j["name"] as? String) ?? cwdName, (j["version"] as? String) ?? "")
+            live[sid] = ((j["name"] as? String) ?? cwdName, (j["version"] as? String) ?? "",
+                         (j["status"] as? String) == "busy", (j["startedAt"] as? Double) ?? 0,
+                         (j["statusUpdatedAt"] as? Double) ?? (j["updatedAt"] as? Double) ?? 0)
         }
         liveSessions = live.count
         versions = Array(Set(live.values.map(\.version).filter { !$0.isEmpty })).sorted()
         // 세션이 끝나면 남은 작업도 조용히 치운다 — 결과를 받을 쪽이 없다
         for sid in Array(watches.keys) where live[sid] == nil { watches.removeValue(forKey: sid) }
+        liveInfo = live.map { LiveSession(id: $0.key, name: $0.value.name, busy: $0.value.busy, startedAt: $0.value.startedAt, statusSince: $0.value.since) }
         for (sid, info) in live {
             if let w = watches[sid] { w.name = info.name; continue }
             if let url = findTranscript(sid) {
@@ -684,6 +754,7 @@ final class Tracker {
             switch b["type"] as? String {
             case "tool_use": toolUse(b, w)
             case "tool_result":
+                if let id = b["tool_use_id"] as? String { w.asks.remove(id) }
                 if let r = j["toolUseResult"] as? [String: Any] { toolResult(b, r, ts: ts, w, sessionId: w.sessionId) }
             default: break
             }
@@ -702,6 +773,7 @@ final class Tracker {
             }
             return
         }
+        if name == "AskUserQuestion" { w.asks.insert(id) }
         var label = (input["description"] as? String) ?? ""
         if label.isEmpty, let c = input["command"] as? String { label = String(c.prefix(40)) }
         w.tools[id] = (name, label.isEmpty ? name : label)
@@ -719,7 +791,7 @@ final class Tracker {
         guard let tid = taskId, !w.ended.contains(tid) else { return }
         let desc = (r["description"] as? String) ?? ""
         let label = desc.isEmpty ? (tool?.label ?? (name.isEmpty ? "작업" : name)) : desc
-        w.running[id] = BgTask(key: id, taskId: tid, kind: name.isEmpty ? "task" : name.lowercased(),
+        w.running[id] = BgTask(key: id, sessionId: w.sessionId, taskId: tid, kind: name.isEmpty ? "task" : name.lowercased(),
                                label: label, sessionName: w.name, startedAt: ts ?? Date(),
                                outputFile: Self.outputFile(r, b, taskId: tid, sessionId: sessionId))
         w.starts += 1
@@ -758,7 +830,7 @@ final class Tracker {
            let code = Int(summary[r.upperBound...].prefix { $0.isNumber }), code >= 128 {
             status = "stopped"
         }
-        let f = Finished(label: task?.label ?? Self.quoted(summary) ?? summary, kind: task?.kind ?? "",
+        let f = Finished(sessionId: w.sessionId, label: task?.label ?? Self.quoted(summary) ?? summary, kind: task?.kind ?? "",
                          status: status, sessionName: w.name, startedAt: task?.startedAt, at: ts ?? Date())
         w.history.append(f)
         if w.history.count > 20 { w.history.removeFirst() }
@@ -808,6 +880,376 @@ struct Bubble {
     var failed = false
     var seconds: Double?     // nil 이면 설정값
     var muted = false        // 멈춤 같은 중립 알림 — 회색
+}
+
+// 말풍선 하나를 그린다. 캐릭터 하나 화면과 사무실 화면이 같이 쓴다. 그린 영역을 돌려준다.
+@discardableResult
+func renderBubble(_ b: Bubble, tailX: CGFloat, baseY: CGFloat, in bounds: NSRect, maxHeight: CGFloat, queued: Int) -> NSRect {
+    let ink = NSColor(white: 0.13, alpha: 1)
+    let text = NSMutableAttributedString()
+    let para = NSMutableParagraphStyle(); para.lineSpacing = 1; para.lineBreakMode = .byWordWrapping
+    text.append(NSAttributedString(string: b.title, attributes: [.font: NSFont.boldSystemFont(ofSize: 13), .foregroundColor: ink, .paragraphStyle: para]))
+    if !b.body.isEmpty {
+        let body = b.body.count > 44 ? String(b.body.prefix(43)) + "…" : b.body
+        text.append(NSAttributedString(string: "\n" + body, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: ink, .paragraphStyle: para]))
+    }
+    if !b.sub.isEmpty {
+        text.append(NSAttributedString(string: "\n" + b.sub, attributes: [.font: NSFont.systemFont(ofSize: 10.5), .foregroundColor: NSColor(white: 0.4, alpha: 1), .paragraphStyle: para]))
+    }
+    let maxW = min(bounds.width - 12, 250)
+    let tr = text.boundingRect(with: NSSize(width: maxW - 22, height: 200), options: [.usesLineFragmentOrigin, .usesFontLeading])
+    let w = min(maxW, ceil(tr.width) + 22)
+    let h = min(maxHeight, ceil(tr.height) + 14)
+    let x = min(max(6, tailX - w / 2), bounds.width - w - 6)
+    let rect = NSRect(x: x, y: baseY, width: w, height: h)
+
+    let path = NSBezierPath(roundedRect: rect, xRadius: 9, yRadius: 9)
+    let tx = min(max(rect.minX + 14, tailX), rect.maxX - 14)
+    let tail = NSBezierPath()
+    tail.move(to: NSPoint(x: tx - 6, y: rect.minY + 1))
+    tail.line(to: NSPoint(x: tx, y: rect.minY - 8))
+    tail.line(to: NSPoint(x: tx + 6, y: rect.minY + 1))
+    let fill = b.failed ? NSColor(red: 1, green: 0.92, blue: 0.91, alpha: 0.98)
+        : b.muted ? NSColor(white: 0.9, alpha: 0.98) : NSColor(white: 1, alpha: 0.98)
+    fill.setFill(); ink.setStroke()
+    path.lineWidth = 1.5; tail.lineWidth = 1.5
+    path.fill(); path.stroke()
+    tail.fill(); tail.stroke()
+    fill.setFill()
+    NSBezierPath(rect: NSRect(x: tx - 5, y: rect.minY - 0.5, width: 10, height: 2.2)).fill()  // 꼬리와 몸통 사이 선 지우기
+    text.draw(with: rect.insetBy(dx: 11, dy: 7), options: [.usesLineFragmentOrigin, .usesFontLeading])
+    if queued > 0 {
+        let q = NSAttributedString(string: "+\(queued)", attributes: [.font: NSFont.boldSystemFont(ofSize: 10), .foregroundColor: NSColor(white: 0.45, alpha: 1)])
+        q.draw(at: NSPoint(x: rect.maxX - q.size().width - 7, y: rect.maxY - q.size().height - 4))
+    }
+    return rect
+}
+
+func drawBadge(_ text: String, center: NSPoint, color: NSColor, radius: CGFloat = 7) {
+    color.setFill()
+    NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)).fill()
+    let s = NSAttributedString(string: text, attributes: [.font: NSFont.boldSystemFont(ofSize: radius * 1.25), .foregroundColor: NSColor.white])
+    let sz = s.size()
+    s.draw(at: NSPoint(x: center.x - sz.width / 2, y: center.y - sz.height / 2))
+}
+
+// MARK: - 사무실 모드
+//
+// 세션 하나 = 책상 하나. 그림은 characters/office/ 의 머리 모양별 시트(사람+책상이 한 프레임).
+// 상태는 sessions/<pid>.json 의 status(busy/idle)와 트랜스크립트(질문 대기·백그라운드 작업)로 정한다.
+
+final class OfficePack {
+    struct Variant { let frames: [CGImage]; let w: CGFloat; let h: CGFloat }
+    let variants: [Variant]
+    let heightPt: CGFloat
+    private let map: [String: [Int]]
+    private let fpsMap: [String: Double]
+
+    init(variants: [Variant], heightPt: CGFloat, map: [String: [Int]], fps: [String: Double]) {
+        self.variants = variants; self.heightPt = heightPt; self.map = map; self.fpsMap = fps
+    }
+
+    func frames(_ key: String) -> [Int] { map[key] ?? [0] }
+    func fps(_ key: String) -> Double { fpsMap[key] ?? 4 }
+    func scale(_ v: Int) -> CGFloat { heightPt / variants[v].h }
+    // 책상 한 칸 폭 — 가장 넓은 시트 기준
+    var slotW: CGFloat { variants.indices.map { variants[$0].w * scale($0) }.max() ?? heightPt }
+
+    static func load(size: Double) throws -> OfficePack {
+        let dir = Paths.characters.appendingPathComponent("office")
+        guard let d = try? Data(contentsOf: dir.appendingPathComponent("character.json")),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
+            throw BuddyError("사무실 캐릭터가 없음: \(dir.path)/character.json")
+        }
+        var variants: [Variant] = []
+        for v in (j["variants"] as? [[String: Any]]) ?? [] {
+            guard let name = v["sheet"] as? String, let fw = v["frameWidth"] as? Int, let fh = v["frameHeight"] as? Int,
+                  let src = CGImageSourceCreateWithURL(dir.appendingPathComponent(name) as CFURL, nil),
+                  let sheet = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+            let cols = sheet.width / fw, count = min((v["frameCount"] as? Int) ?? cols, cols)
+            let frames = (0..<count).compactMap { sheet.cropping(to: CGRect(x: $0 * fw, y: 0, width: fw, height: fh)) }
+            if !frames.isEmpty { variants.append(Variant(frames: frames, w: CGFloat(fw), h: CGFloat(fh))) }
+        }
+        guard !variants.isEmpty else { throw BuddyError("사무실 시트를 하나도 열지 못함") }
+        let map = (j["frames"] as? [String: [Int]]) ?? [:]
+        let n = variants.map(\.frames.count).min() ?? 0
+        for (k, fr) in map { if let bad = fr.first(where: { $0 < 0 || $0 >= n }) { throw BuddyError("frames.\(k) 의 \(bad) 이 범위를 벗어남") } }
+        let h = CGFloat(((j["height"] as? Double) ?? 40) * size)
+        return OfficePack(variants: variants, heightPt: h, map: map, fps: (j["fps"] as? [String: Double]) ?? [:])
+    }
+}
+
+final class Seat {
+    let id: String
+    var name: String
+    var variant: Int
+    let startedAt: Double
+    var busy = false, question = false
+    var tasks = 0, agents = 0
+    var flash: (kind: String, until: Date)?     // cheer·sad 를 잠깐
+    var walkIn: Date?, walkOut: Date?           // 출근(또는 복귀) / 세션 종료로 퇴장
+    var away = false                            // 오래 쉬어서 퇴근함 — 빈 책상만 남음
+    var leaving: Date?                          // 퇴근하며 걸어 나가는 중 (책상은 남김)
+    var idleMinutes = 0.0
+    init(id: String, name: String, variant: Int, startedAt: Double) {
+        self.id = id; self.name = name; self.variant = variant; self.startedAt = startedAt
+    }
+    var priority: Int { question ? 0 : busy ? 1 : away ? 3 : 2 }
+}
+
+final class OfficeView: NSView {
+    static let bubbleArea: CGFloat = 92
+    static let maxDesks = 4
+    static let walkTime = 1.4
+
+    var pack: OfficePack
+    private(set) var seats: [String: Seat] = [:]
+    private(set) var shown: [Seat] = []          // 화면에 앉은 순서대로 (최대 4)
+    private(set) var overflow = 0
+    private var primed = false
+    private var bubbles: [(seat: String, bubble: Bubble)] = []
+    private var current: (seat: String, bubble: Bubble, at: Date)?
+    private var bubbleRect: NSRect?
+    var bubbleSeconds = 15.0
+    var leaveAfter = 30.0 * 60
+
+    var onMenu: ((NSEvent) -> Void)?
+    var onMoved: (() -> Void)?
+
+    init(pack: OfficePack) {
+        self.pack = pack
+        super.init(frame: NSRect(origin: .zero, size: OfficeView.size(for: pack)))
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    static let margin: CGFloat = 8, gap: CGFloat = 4
+    static func size(for p: OfficePack) -> NSSize {
+        let w = margin * 2 + CGFloat(maxDesks) * p.slotW + CGFloat(maxDesks - 1) * gap + p.slotW * 0.45 + 22
+        return NSSize(width: max(220, ceil(w)), height: ceil(p.heightPt) + 18 + bubbleArea)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    // 세션마다 다른 머리 모양. 세션 ID 로 고정하고, 이미 앉은 사람과 겹치지 않는 것을 고른다
+    private func pickVariant(_ id: String) -> Int {
+        let n = pack.variants.count
+        var h: UInt32 = 2166136261
+        for b in id.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
+        let used = Set(seats.values.filter { $0.walkOut == nil }.map(\.variant))
+        for k in 0..<n { let v = (Int(h % UInt32(n)) + k) % n; if !used.contains(v) { return v } }
+        return Int(h % UInt32(n))
+    }
+
+    func update(live: [LiveSession], tasks: [BgTask], events: [Finished], visible: Bool) {
+        let now = Date()
+        let ids = Set(live.map(\.id))
+        for l in live {
+            let s = seats[l.id] ?? {
+                let s = Seat(id: l.id, name: l.name, variant: pickVariant(l.id), startedAt: l.startedAt)
+                if primed { s.walkIn = now }         // 앱을 켤 때 이미 있던 세션은 걸어 들어오지 않는다
+                seats[l.id] = s
+                return s
+            }()
+            s.name = l.name; s.busy = l.busy; s.question = l.question; s.walkOut = nil
+            let mine = tasks.filter { $0.sessionId == l.id }
+            s.tasks = mine.count
+            s.agents = mine.filter { $0.kind == "agent" }.count
+            // 오래 쉬면 퇴근(빈 책상). 질문 대기·백그라운드 작업 중이면 자리를 지킨다
+            s.idleMinutes = l.statusSince > 0 ? max(0, now.timeIntervalSince1970 - l.statusSince / 1000) / 60 : 0
+            let away = !l.busy && !l.question && s.tasks == 0 && l.statusSince > 0
+                && now.timeIntervalSince1970 - l.statusSince / 1000 > leaveAfter
+            if away != s.away {
+                s.away = away
+                if primed && s.walkIn == nil {
+                    if away { s.leaving = now } else { s.leaving = nil; s.walkIn = now }
+                }
+            }
+        }
+        for s in seats.values where !ids.contains(s.id) && s.walkOut == nil {
+            if primed && shown.contains(where: { $0 === s }) { s.walkOut = now } else { seats.removeValue(forKey: s.id) }
+        }
+        primed = true
+        for f in events {
+            guard let s = seats[f.sessionId] else { continue }
+            if !s.away {
+                if f.ok { s.flash = ("cheer", now.addingTimeInterval(2.5)) }
+                if f.failed { s.flash = ("sad", now.addingTimeInterval(2.5)) }
+            }
+            guard visible else { continue }
+            var sub = s.name
+            if let st = f.startedAt { sub += " · " + formatDuration(f.at.timeIntervalSince(st)) }
+            if f.ok || f.failed {
+                bubbles.append((s.id, Bubble(title: f.ok ? "끝났어!" : "실패했어…", body: f.label, sub: sub, failed: f.failed)))
+            } else if f.stopped {
+                bubbles.append((s.id, Bubble(title: "멈췄어", body: f.label, sub: s.name + " · 직접 끈 작업", seconds: 5, muted: true)))
+            }
+        }
+        relayout()
+    }
+
+    // 질문 대기 > 작업 중 > 쉬는 중 순으로 4명을 고르고, 고른 사람은 출근 순서대로 앉힌다 (자리가 덜 바뀌게)
+    private func relayout() {
+        let all = seats.values.sorted { ($0.priority, $0.startedAt) < ($1.priority, $1.startedAt) }
+        let pick = Array(all.prefix(OfficeView.maxDesks))
+        let wasShown = Set(shown.map(\.id))
+        shown = pick.sorted { $0.startedAt < $1.startedAt }
+        overflow = max(0, all.count - pick.count)
+        // 화면에 앉은 사람끼리는 머리 모양이 겹치지 않게: 이미 앉아 있던 사람 것은 그대로 두고,
+        // 새로 앉는 사람만 남은 모양에서 다시 고른다 (세션이 머리 모양 수보다 많을 때 생기는 겹침)
+        var used = Set(shown.filter { wasShown.contains($0.id) }.map(\.variant))
+        for st in shown where !wasShown.contains(st.id) {
+            if used.contains(st.variant), let free = (0..<pack.variants.count).first(where: { !used.contains($0) }) { st.variant = free }
+            used.insert(st.variant)
+        }
+    }
+
+    func showInfo(_ s: Seat) {
+        let state = s.question ? "질문에 답을 기다리는 중" : s.busy ? "작업 중"
+            : s.away ? "퇴근 (\(formatDuration(s.idleMinutes * 60))째 쉬는 중)" : "쉬는 중"
+        var body = state
+        if s.tasks > 0 { body += " · 백그라운드 \(s.tasks)개" }
+        current = (s.id, Bubble(title: s.name, body: body, sub: "", seconds: 4), Date())
+    }
+
+    func test(_ kind: String) {
+        guard let s = shown.first else { return }
+        let now = Date()
+        let f = Finished(sessionId: s.id, label: "테스트 작업", kind: "test", status: kind == "failed" ? "failed" : kind == "stopped" ? "stopped" : "completed",
+                         sessionName: s.name, startedAt: now.addingTimeInterval(-133), at: now)
+        update(live: seats.values.map { LiveSession(id: $0.id, name: $0.name, busy: $0.busy, startedAt: $0.startedAt, question: $0.question) },
+               tasks: [], events: [f], visible: true)
+    }
+
+    var idle: Bool { current == nil && bubbles.isEmpty && !seats.values.contains { $0.busy || $0.question || $0.walkIn != nil || $0.walkOut != nil || $0.leaving != nil || $0.tasks > 0 } }
+
+    func tick(_ now: Date) {
+        var changed = false
+        for s in seats.values {
+            if let f = s.flash, f.until <= now { s.flash = nil; changed = true }
+            if let w = s.walkIn, now.timeIntervalSince(w) > OfficeView.walkTime { s.walkIn = nil; changed = true }
+            if let w = s.leaving, now.timeIntervalSince(w) > OfficeView.walkTime { s.leaving = nil; changed = true }
+            if let w = s.walkOut, now.timeIntervalSince(w) > OfficeView.walkTime { seats.removeValue(forKey: s.id); changed = true }
+        }
+        if changed { relayout() }
+        if current == nil, !bubbles.isEmpty { let b = bubbles.removeFirst(); current = (b.seat, b.bubble, now) }
+        if let c = current {
+            let limit = c.bubble.seconds ?? bubbleSeconds
+            if (limit > 0 && now.timeIntervalSince(c.at) > limit) || seats[c.seat] == nil { current = nil }
+        }
+        needsDisplay = true
+    }
+
+    private func slotX(_ i: Int) -> CGFloat { OfficeView.margin + CGFloat(i) * (pack.slotW + OfficeView.gap) }
+    private let floorY: CGFloat = 6
+
+    private func frameRect(_ s: Seat, x: CGFloat, image: CGImage, scale k: CGFloat = 1) -> NSRect {
+        let sc = pack.scale(s.variant) * k
+        let w = CGFloat(image.width) * sc, h = CGFloat(image.height) * sc
+        return NSRect(x: (x + (pack.slotW - w) / 2).rounded(), y: floorY, width: w, height: h)
+    }
+
+    private func cycle(_ key: String, _ since: Date) -> Int {
+        let fr = pack.frames(key)
+        return fr[Int(Date().timeIntervalSince(since) * pack.fps(key)) % fr.count]
+    }
+
+    private var seatRects: [(Seat, NSRect)] = []
+
+    override func draw(_ dirty: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.interpolationQuality = .high
+        seatRects = []
+        let now = Date()
+        // 바닥: 앉은 사람 수만큼의 옅은 띠
+        if !shown.isEmpty {
+            let w = CGFloat(shown.count) * (pack.slotW + OfficeView.gap) - OfficeView.gap
+            NSColor(white: 0.5, alpha: 0.16).setFill()
+            NSBezierPath(roundedRect: NSRect(x: OfficeView.margin - 3, y: 1, width: w + 6, height: floorY + pack.heightPt * 0.18), xRadius: 6, yRadius: 6).fill()
+        }
+        for (i, s) in shown.enumerated() {
+            let v = pack.variants[s.variant]
+            let x = slotX(i)
+            if let start = s.walkIn ?? s.walkOut ?? s.leaving {
+                // 출근·퇴근: 빈 책상 + 걷는 사람. 들어올 때는 오른쪽 끝에서 왼쪽으로(좌우 반전), 나갈 때는 오른쪽으로
+                let empty = v.frames[pack.frames("empty")[0]]
+                ctx.draw(empty, in: frameRect(s, x: x, image: empty))
+                let t = min(1, now.timeIntervalSince(start) / OfficeView.walkTime)
+                let walker = v.frames[cycle("walk", start)]
+                let wr = frameRect(s, x: x, image: walker, scale: 0.92)
+                let far = bounds.width - wr.width - 2, near = wr.minX
+                let coming = s.walkIn != nil && s.leaving == nil
+                let wx = coming ? far + (near - far) * CGFloat(t) : near + (far - near) * CGFloat(t)
+                let r = NSRect(x: wx, y: wr.minY, width: wr.width, height: wr.height)
+                // 출근·복귀 중에 퇴근 상태가 되면 걸어 나가는 쪽으로 그린다
+                if s.walkIn != nil && s.leaving == nil {
+                    ctx.saveGState(); ctx.translateBy(x: r.midX, y: 0); ctx.scaleBy(x: -1, y: 1); ctx.translateBy(x: -r.midX, y: 0)
+                    ctx.draw(walker, in: r); ctx.restoreGState()
+                } else { ctx.draw(walker, in: r) }
+                continue
+            }
+            if s.away {
+                // 퇴근: 빈 책상만
+                let empty = v.frames[pack.frames("empty")[0]]
+                let r = frameRect(s, x: x, image: empty)
+                ctx.draw(empty, in: r)
+                seatRects.append((s, r))
+                continue
+            }
+            let key = s.flash?.kind ?? (s.question ? "raise" : s.busy ? "typing" : "sleep")
+            let img = v.frames[key == "typing" ? cycle("typing", Date(timeIntervalSince1970: 0)) : pack.frames(key)[0]]
+            let r = frameRect(s, x: x, image: img)
+            ctx.draw(img, in: r)
+            seatRects.append((s, r))
+            if s.agents > 0 {
+                // 백그라운드 에이전트 = 책상 옆에 선 사람
+                let st = v.frames[pack.frames("stand")[0]]
+                let ar = frameRect(s, x: x, image: st, scale: 0.62)
+                ctx.draw(st, in: NSRect(x: r.maxX - ar.width * 0.55, y: floorY, width: ar.width, height: ar.height))
+            }
+            if s.question { drawBadge("!", center: NSPoint(x: r.maxX - 8, y: r.maxY - 6), color: NSColor(red: 1, green: 0.42, blue: 0.29, alpha: 1)) }
+            if s.tasks > 0 { drawBadge("\(s.tasks)", center: NSPoint(x: r.minX + 7, y: r.minY + r.height * 0.42), color: NSColor(red: 0.27, green: 0.5, blue: 0.95, alpha: 1), radius: 6) }
+        }
+        if overflow > 0 {
+            let t = NSAttributedString(string: "+\(overflow)", attributes: [.font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor(white: 0.35, alpha: 1)])
+            t.draw(at: NSPoint(x: slotX(shown.count) + 2, y: floorY + 4))
+        }
+        bubbleRect = nil
+        if let c = current, let i = shown.firstIndex(where: { $0.id == c.seat }) {
+            let top = floorY + pack.heightPt + 8
+            bubbleRect = renderBubble(c.bubble, tailX: slotX(i) + pack.slotW / 2, baseY: top, in: bounds,
+                                      maxHeight: OfficeView.bubbleArea - 12, queued: bubbles.count)
+        }
+    }
+
+    func seat(at p: NSPoint) -> Seat? { seatRects.first { $0.1.insetBy(dx: -2, dy: -2).contains(p) }?.0 }
+
+    func hit(_ p: NSPoint) -> Bool {
+        seat(at: p) != nil || (bubbleRect?.insetBy(dx: -2, dy: -10).contains(p) ?? false)
+    }
+
+    func tooltip(at p: NSPoint) -> String? {
+        guard let s = seat(at: p) else { return nil }
+        return s.name + (s.question ? " · 질문 대기" : s.busy ? " · 작업 중" : s.away ? " · 퇴근" : " · 쉬는 중") + (s.tasks > 0 ? " · 백그라운드 \(s.tasks)개" : "")
+    }
+
+    private var dragStart: NSPoint?, originStart: NSPoint?, dragged = false
+    override func mouseDown(with e: NSEvent) {
+        dragStart = NSEvent.mouseLocation; originStart = window?.frame.origin; dragged = false
+    }
+    override func mouseDragged(with e: NSEvent) {
+        guard let s = dragStart, let o = originStart, let win = window else { return }
+        let p = NSEvent.mouseLocation
+        if abs(p.x - s.x) + abs(p.y - s.y) > 3 { dragged = true }
+        if dragged { win.setFrameOrigin(NSPoint(x: o.x + p.x - s.x, y: o.y + p.y - s.y)) }
+    }
+    override func mouseUp(with e: NSEvent) {
+        defer { dragStart = nil }
+        if dragged { onMoved?(); return }
+        let p = convert(e.locationInWindow, from: nil)
+        if current != nil, bubbleRect?.insetBy(dx: -2, dy: -10).contains(p) ?? false { current = nil; needsDisplay = true; return }
+        if let s = seat(at: p) { showInfo(s); needsDisplay = true }
+    }
+    override func rightMouseDown(with e: NSEvent) { onMenu?(e) }
 }
 
 final class BuddyView: NSView {
@@ -904,44 +1346,8 @@ final class BuddyView: NSView {
     }
 
     private func drawBubble(_ b: Bubble) {
-        let ink = NSColor(white: 0.13, alpha: 1)
-        let text = NSMutableAttributedString()
-        let para = NSMutableParagraphStyle(); para.lineSpacing = 1; para.lineBreakMode = .byWordWrapping
-        text.append(NSAttributedString(string: b.title, attributes: [.font: NSFont.boldSystemFont(ofSize: 13), .foregroundColor: ink, .paragraphStyle: para]))
-        if !b.body.isEmpty {
-            let body = b.body.count > 44 ? String(b.body.prefix(43)) + "…" : b.body
-            text.append(NSAttributedString(string: "\n" + body, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: ink, .paragraphStyle: para]))
-        }
-        if !b.sub.isEmpty {
-            text.append(NSAttributedString(string: "\n" + b.sub, attributes: [.font: NSFont.systemFont(ofSize: 10.5), .foregroundColor: NSColor(white: 0.4, alpha: 1), .paragraphStyle: para]))
-        }
-        let maxW = bounds.width - 12
-        let tr = text.boundingRect(with: NSSize(width: maxW - 22, height: 200), options: [.usesLineFragmentOrigin, .usesFontLeading])
-        let w = min(maxW, ceil(tr.width) + 22)
-        let h = min(BuddyView.bubbleArea - 12, ceil(tr.height) + 14)
-        let x = min(max(6, spriteRect.midX - w / 2), bounds.width - w - 6)
-        let rect = NSRect(x: x, y: spriteRect.maxY + 10, width: w, height: h)
-        bubbleRect = rect
-
-        let path = NSBezierPath(roundedRect: rect, xRadius: 9, yRadius: 9)
-        let tx = min(max(rect.minX + 14, spriteRect.midX), rect.maxX - 14)
-        let tail = NSBezierPath()
-        tail.move(to: NSPoint(x: tx - 6, y: rect.minY + 1))
-        tail.line(to: NSPoint(x: tx, y: rect.minY - 8))
-        tail.line(to: NSPoint(x: tx + 6, y: rect.minY + 1))
-        let fill = b.failed ? NSColor(red: 1, green: 0.92, blue: 0.91, alpha: 0.98)
-            : b.muted ? NSColor(white: 0.9, alpha: 0.98) : NSColor(white: 1, alpha: 0.98)
-        fill.setFill(); ink.setStroke()
-        path.lineWidth = 1.5; tail.lineWidth = 1.5
-        path.fill(); path.stroke()
-        tail.fill(); tail.stroke()
-        fill.setFill()
-        NSBezierPath(rect: NSRect(x: tx - 5, y: rect.minY - 0.5, width: 10, height: 2.2)).fill()  // 꼬리와 몸통 사이 선 지우기
-        text.draw(with: rect.insetBy(dx: 11, dy: 7), options: [.usesLineFragmentOrigin, .usesFontLeading])
-        if queued > 0 {
-            let q = NSAttributedString(string: "+\(queued)", attributes: [.font: NSFont.boldSystemFont(ofSize: 10), .foregroundColor: NSColor(white: 0.45, alpha: 1)])
-            q.draw(at: NSPoint(x: rect.maxX - q.size().width - 7, y: rect.maxY - q.size().height - 4))
-        }
+        bubbleRect = renderBubble(b, tailX: spriteRect.midX, baseY: spriteRect.maxY + 10, in: bounds,
+                                  maxHeight: BuddyView.bubbleArea - 12, queued: queued)
     }
 
     func hit(_ p: NSPoint) -> Bool {
@@ -973,6 +1379,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusShown = ""
     var dismissed: Set<String> = []
     var view: BuddyView!
+    var office: OfficeView?
+    var live: [LiveSession] = []
     var config = Config.load()
     var tracker: Tracker!
     let queue = DispatchQueue(label: "bgbuddy.tracker")
@@ -1001,14 +1409,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.hidesOnDeactivate = false
-        panel.contentView = view
-        placeWindow(anchor: savedAnchor())
-        panel.orderFrontRegardless()
-        updateStatusItem()
-
         view.onClick = { [weak self] in self?.clicked() }
         view.onMenu = { [weak self] e in self?.showMenu(e) }
         view.onMoved = { [weak self] in self?.saveAnchor() }
+        applyMode()
+        placeWindow(anchor: savedAnchor())
+        panel.orderFrontRegardless()
+        updateStatusItem()
 
         let dnc = DistributedNotificationCenter.default()
         dnc.addObserver(forName: Notification.Name("local.bgbuddy.poke"), object: nil, queue: .main) { [weak self] n in
@@ -1055,8 +1462,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return NSPoint(x: v.maxX - 90, y: v.minY + 16)
     }
 
+    var officeMode: Bool { office != nil && config.mode == "office" }
+    var content: NSView { officeMode ? office! : view }
+
+    // 모드에 맞는 화면을 창에 끼운다. 사무실 그림을 못 열면 캐릭터 하나 모드로 돌아간다
+    func applyMode() {
+        if config.mode == "office" {
+            do {
+                let pack = try OfficePack.load(size: config.size)
+                if let o = office { o.pack = pack; o.setFrameSize(OfficeView.size(for: pack)) }
+                else {
+                    let o = OfficeView(pack: pack)
+                    o.onMenu = { [weak self] e in self?.showMenu(e) }
+                    o.onMoved = { [weak self] in self?.saveAnchor() }
+                    office = o
+                }
+            } catch { NSLog("BgBuddy: \(error)"); office = nil }
+        }
+        if panel.contentView !== content { panel.contentView = content }
+    }
+
     func placeWindow(anchor: NSPoint) {
-        let s = view.frame.size
+        let s = content.frame.size
         panel.setFrame(NSRect(x: (anchor.x - s.width / 2).rounded(), y: anchor.y - 2, width: s.width, height: s.height), display: true)
     }
 
@@ -1072,11 +1499,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.character = loadCharacter()
         view.resetExtras()  // 이전 캐릭터의 프레임 번호가 남지 않게
         view.setFrameSize(BuddyView.size(for: view.character))
+        applyMode()
         placeWindow(anchor: anchor)
         let c = config
         queue.async { self.tracker.config = c }
         updateStatusItem(rebuildIcon: true)
-        view.needsDisplay = true
+        content.needsDisplay = true
     }
 
     // MARK: 추적
@@ -1087,7 +1515,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         queue.async {
             let events = self.tracker.poll()
             let running = self.tracker.running
-            DispatchQueue.main.async { self.apply(running, events); self.polling = false }
+            let live = self.tracker.live
+            DispatchQueue.main.async { self.live = live; self.apply(running, events); self.polling = false }
         }
     }
 
@@ -1096,6 +1525,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dismissed.formIntersection(running.map(\.key))
         tasks = running.filter { !dismissed.contains($0.key) }
         view.badge = tasks.count
+        if officeMode, let o = office {
+            o.leaveAfter = config.leaveAfterMinutes * 60
+            o.update(live: live, tasks: tasks, events: events, visible: config.visible)
+            if events.contains(where: { $0.ok || $0.failed }) {
+                doneMarkUntil = Date().addingTimeInterval(max(config.bubbleSeconds, 15))
+                if config.visible, let s = config.sound { NSSound(named: NSSound.Name(s))?.play() }
+            }
+            refreshStatusTitle()
+            return
+        }
         if config.visible {
             for f in events where f.stopped {
                 bubbles.append(Bubble(title: "멈췄어", body: f.label, sub: f.sessionName + " · 직접 끈 작업", seconds: 5, muted: true))
@@ -1134,6 +1573,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func tick() {
         let now = Date()
+        if officeMode, let o = office {
+            o.bubbleSeconds = config.bubbleSeconds
+            o.leaveAfter = config.leaveAfterMinutes * 60
+            o.tick(now)
+            let m = NSEvent.mouseLocation
+            let p = NSPoint(x: m.x - panel.frame.minX, y: m.y - panel.frame.minY)
+            panel.ignoresMouseEvents = !o.hit(p)
+            o.toolTip = o.tooltip(at: p)
+            let hide = !config.visible || (config.hideWhenIdle && o.idle)
+            if let d = doneMarkUntil, d <= now { doneMarkUntil = nil; refreshStatusTitle() }
+            if hide && panel.isVisible { panel.orderOut(nil) }
+            if !hide && !panel.isVisible { panel.orderFrontRegardless() }
+            return
+        }
         if view.mood == .done || view.mood == .failed {
             let a = view.character.anim(view.mood.rawValue)
             if now.timeIntervalSince(view.moodStart) > max(a.loop ? 2.5 : a.duration + 1, 2.0) { setMood(baseMood) }
@@ -1180,6 +1633,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func poke(_ kind: String) {
         let now = Date()
+        if officeMode, let o = office {
+            if ["done", "failed", "stopped"].contains(kind) { o.test(kind) }
+            return
+        }
         func fake(_ label: String, _ status: String, _ ago: Double) -> Finished {
             Finished(label: label, kind: "test", status: status, sessionName: "테스트", startedAt: now.addingTimeInterval(-ago), at: now)
         }
@@ -1200,7 +1657,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func showMenu(_ e: NSEvent) {
         let menu = NSMenu()
         fillMenu(menu)
-        NSMenu.popUpContextMenu(menu, with: e, for: view)
+        NSMenu.popUpContextMenu(menu, with: e, for: content)
     }
 
     // 메뉴 막대 아이콘 메뉴는 열 때마다 새로 채운다
@@ -1211,6 +1668,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let vis = NSMenuItem(title: "캐릭터 보이기", action: #selector(toggleVisible), keyEquivalent: "")
         vis.target = self; vis.state = config.visible ? .on : .off
         menu.addItem(vis)
+        let mode = NSMenuItem(title: "사무실 모드", action: #selector(toggleMode), keyEquivalent: "")
+        mode.target = self; mode.state = config.mode == "office" ? .on : .off
+        mode.isEnabled = FileManager.default.fileExists(atPath: Paths.characters.appendingPathComponent("office/character.json").path)
+        menu.addItem(mode)
         menu.addItem(.separator())
         let head = NSMenuItem(title: tasks.isEmpty ? "백그라운드 작업 없음" : "백그라운드 작업 \(tasks.count)개", action: nil, keyEquivalent: "")
         head.isEnabled = false
@@ -1294,11 +1755,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func rebuildStatusIcon() {
         guard let button = statusItem?.button else { return }
         let c = view.character
-        let frame = c.frames[c.anim("idle").frames[0]]
+        var frame = c.frames[c.anim("idle").frames[0]]
+        var pixelated = c.pixelated
+        if officeMode, let o = office {
+            // 사무실 모드: 서 있는 사람(첫 번째 머리 모양)에서 빈 여백을 잘라 아이콘으로
+            let st = o.pack.variants[0].frames[o.pack.frames("stand")[0]]
+            frame = Self.trimmed(st) ?? st
+            pixelated = false
+        }
         let h: CGFloat = 18, w = min(28, h * CGFloat(frame.width) / CGFloat(frame.height))
         let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { r in
             guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            ctx.interpolationQuality = c.pixelated ? .none : .high
+            ctx.interpolationQuality = pixelated ? .none : .high
             let fw = CGFloat(frame.width), fh = CGFloat(frame.height)
             let s = min(r.width / fw, r.height / fh)
             ctx.draw(frame, in: CGRect(x: (r.width - fw * s) / 2, y: (r.height - fh * s) / 2, width: fw * s, height: fh * s))
@@ -1306,6 +1774,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         button.image = img
         button.toolTip = "BG Buddy"
+    }
+
+    // 투명한 가장자리를 잘라낸다
+    static func trimmed(_ img: CGImage) -> CGImage? {
+        let w = img.width, h = img.height
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let ok = px.withUnsafeMutableBytes { p -> Bool in
+            guard let ctx = CGContext(data: p.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h)); return true
+        }
+        guard ok else { return nil }
+        var x0 = w, y0 = h, x1 = -1, y1 = -1
+        for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 0 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
+        guard x1 >= x0 else { return nil }
+        return img.cropping(to: CGRect(x: x0, y: y0, width: x1 - x0 + 1, height: y1 - y0 + 1))
     }
 
     // 작업 수 / 방금 끝남(✓) / 꺼져 있음 표시. 바뀔 때만 다시 그린다
@@ -1352,6 +1836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if config.menuBarIcon && !config.visible { try? Config.set("visible", true) }
         try? Config.set("menu_bar_icon", !config.menuBarIcon); reload()
     }
+    @objc func toggleMode() { try? Config.set("mode", config.mode == "office" ? "buddy" : "office"); reload() }
     @objc func toggleHide() { try? Config.set("hide_when_idle", !config.hideWhenIdle); reload() }
     @objc func testBubble() { poke("done") }
 }
@@ -1389,6 +1874,37 @@ enum CLI {
                 post("local.bgbuddy.reload", nil); return 0
             case "--quit":
                 post("local.bgbuddy.quit", nil); return 0
+            case "--render-office":
+                // 확인용: 지금 세션 상태로 사무실 화면을 PNG 로 그린다 (Retina 2배)
+                guard args.count > 1 else { throw BuddyError("사용법: --render-office <출력.png> [test]") }
+                let c = Config.load()
+                let v = OfficeView(pack: try OfficePack.load(size: c.size))
+                let t = Tracker(config: c); _ = t.poll()
+                v.leaveAfter = c.leaveAfterMinutes * 60
+                var lv = t.live
+                if args.count > 2 && args[2] == "away" {
+                    // 시험: 모든 세션이 1시간째 쉬는 것으로 간주 (첫 번째만 작업 중으로 남김)
+                    lv = lv.enumerated().map { i, l in
+                        LiveSession(id: l.id, name: l.name, busy: i == 0, startedAt: l.startedAt,
+                                    statusSince: (Date().timeIntervalSince1970 - 3600) * 1000)
+                    }
+                }
+                v.update(live: lv, tasks: [], events: [], visible: true)
+                if args.count > 2 && args[2] != "away" { v.test(args[2]) }
+                v.tick(Date())
+                let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(v.bounds.width * 2), pixelsHigh: Int(v.bounds.height * 2),
+                                           bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                           colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+                rep.size = v.bounds.size
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+                NSColor(white: 0.93, alpha: 1).setFill(); v.bounds.fill()
+                v.draw(v.bounds)
+                NSGraphicsContext.restoreGraphicsState()
+                try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: args[1]))
+                print("세션 \(t.live.count)개 → 책상 \(v.shown.count)개" + (v.overflow > 0 ? " (+\(v.overflow))" : "") + " · 창 \(Int(v.bounds.width))×\(Int(v.bounds.height))pt")
+                for st in v.shown { print("  \(st.name): " + (st.question ? "질문 대기" : st.busy ? "작업 중" : st.away ? "퇴근 (\(Int(st.idleMinutes))분째 쉼)" : "쉬는 중 (\(Int(st.idleMinutes))분째)") + (st.tasks > 0 ? " · 백그라운드 \(st.tasks)" : "")) }
+                return 0
             case "--set":
                 guard args.count > 2 else { throw BuddyError("사용법: --set <키> <값>") }
                 let v = args[2]

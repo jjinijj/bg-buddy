@@ -1,0 +1,22 @@
+{
+  "name": "office",
+  "type": "office",
+  "height": 40,
+  "variants": [
+    { "sheet": "hair1.png", "frameWidth": 265, "frameHeight": 347, "frameCount": 13 },
+    { "sheet": "hair2.png", "frameWidth": 283, "frameHeight": 366, "frameCount": 13 },
+    { "sheet": "hair3.png", "frameWidth": 279, "frameHeight": 351, "frameCount": 13 },
+    { "sheet": "hair4.png", "frameWidth": 267, "frameHeight": 352, "frameCount": 13 }
+  ],
+  "frames": {
+    "typing": [0, 1, 2, 1],
+    "sleep": [3],
+    "cheer": [4],
+    "sad": [5],
+    "raise": [6],
+    "walk": [7, 8, 9, 10],
+    "stand": [11],
+    "empty": [12]
+  },
+  "fps": { "typing": 4, "walk": 8 }
+}
