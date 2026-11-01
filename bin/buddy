@@ -34,6 +34,8 @@ case "${1:-start}" in
       office|buddy) "$EXE" --set mode "$2" && echo "모드: $2" ;;
       *) echo "사용법: buddy mode office | buddy   (사무실 / 캐릭터 하나)"; exit 2 ;;
     esac ;;
+  log|logs)
+    need_app; shift; "$EXE" --log "$@" ;;
   show)
     need_app; "$EXE" --set visible true && echo "캐릭터 보이기: 켬" ;;
   hide)
@@ -64,6 +66,7 @@ case "${1:-start}" in
     cat <<USAGE
 buddy                    캐릭터 띄우기
 buddy tasks [--debug]    지금 도는 백그라운드 작업과 최근 끝난 작업
+buddy log [--date D] [--session 이름]  사건 기록 (출근·퇴근·질문·작업·세션 간 메시지)
 buddy doctor             감지·캐릭터 점검
 buddy test [종류]        시험 (done | failed | stopped | many | working | extra)
 buddy show | hide        캐릭터 켜기 / 끄기

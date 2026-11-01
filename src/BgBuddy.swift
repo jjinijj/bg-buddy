@@ -577,6 +577,108 @@ struct Finished {
     var stopped: Bool { status == "stopped" || status == "killed" }
 }
 
+// MARK: - 사건 기록
+//
+// ~/Library/Logs/BgBuddy/YYYY-MM-DD.jsonl 에 한 줄에 사건 하나. macOS 앱 로그의 표준 위치라
+// 다시 설치해도 남고 콘솔 앱에서도 보인다. 30일 지난 파일은 지운다. 이 맥 밖으로는 아무것도 보내지 않는다.
+// 남기는 것: 출근·종료, 퇴근·복귀, 질문 올림·답 받음, 백그라운드 작업 시작·끝, 세션 간 메시지(첫 줄만).
+// 매 턴의 일 시작·쉬기는 대화할 때마다 생겨 로그를 뒤덮으므로 남기지 않는다.
+
+struct LogEvent {
+    let at: Date
+    let type: String         // start arrive end away back ask answer task_start task_end message
+    let session: String
+    let sid: String
+    var extra: [String: Any] = [:]
+
+    var json: [String: Any] {
+        var j = extra
+        j["t"] = EventLog.iso.string(from: at); j["type"] = type; j["session"] = session
+        if !sid.isEmpty { j["sid"] = sid }
+        return j
+    }
+
+    init(at: Date, type: String, session: String, sid: String, extra: [String: Any] = [:]) {
+        self.at = at; self.type = type; self.session = session; self.sid = sid; self.extra = extra
+    }
+
+    init?(json j: [String: Any]) {
+        guard let t = j["t"] as? String, let at = EventLog.iso.date(from: t), let type = j["type"] as? String else { return nil }
+        self.at = at; self.type = type; self.session = (j["session"] as? String) ?? ""; self.sid = (j["sid"] as? String) ?? ""
+        self.extra = j.filter { !["t", "type", "session", "sid"].contains($0.key) }
+    }
+
+    // 사람이 읽는 한 줄: "14:03:52  메시지    A → B  “첫 줄”"
+    var line: String {
+        let time = EventLog.clock.string(from: at)
+        func s(_ k: String) -> String { (extra[k] as? String) ?? "" }
+        let (what, rest): (String, String) = {
+            switch type {
+            case "start": return ("시작", "BG Buddy · 세션 \((extra["count"] as? Int) ?? 0)개")
+            case "arrive": return ("출근", session + (s("kind") == "bg" ? " (백그라운드)" : ""))
+            case "end": return ("종료", session)
+            case "away": return ("퇴근", "\(session) (\((extra["idle_min"] as? Int) ?? 0)분 쉼)")
+            case "back": return ("복귀", session)
+            case "ask": return ("질문", session + (s("header").isEmpty ? "" : " · " + s("header")))
+            case "answer": return ("답 받음", session)
+            case "task_start": return ("작업 시작", "\(session) [\(s("kind"))] \(s("label"))")
+            case "task_end":
+                let st = s("status"), name = st == "completed" ? "작업 끝" : st.hasPrefix("fail") ? "작업 실패" : "작업 멈춤"
+                let dur = (extra["dur"] as? Int).map { " · " + formatDuration(Double($0)) } ?? ""
+                return (name, "\(session) \(s("label"))\(dur)")
+            case "message": return ("메시지", "\(session) → \(s("to"))  “\(s("text"))”")
+            default: return (type, session)
+            }
+        }()
+        let pad = String(repeating: " ", count: max(1, 9 - what.count * 2 + what.unicodeScalars.filter { $0.isASCII }.count))
+        return "\(time)  \(what)\(pad)\(rest)"
+    }
+}
+
+enum EventLog {
+    static let dir = Paths.home.appendingPathComponent("Library/Logs/BgBuddy")
+    static let keepDays = 30
+    static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; f.timeZone = .current; return f
+    }()
+    static let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm:ss"; return f }()
+    static let day: DateFormatter = { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX"); return f }()
+
+    static func file(for date: Date) -> URL { dir.appendingPathComponent(day.string(from: date) + ".jsonl") }
+
+    static func append(_ events: [LogEvent]) {
+        guard !events.isEmpty else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for e in events {
+            guard let d = try? JSONSerialization.data(withJSONObject: e.json, options: [.sortedKeys, .withoutEscapingSlashes]) else { continue }
+            let url = file(for: e.at)
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile(); h.write(d); h.write(Data("\n".utf8)); try? h.close()
+            } else {
+                try? (d + Data("\n".utf8)).write(to: url)
+            }
+        }
+    }
+
+    static func read(day d: Date) -> [LogEvent] {
+        guard let text = try? String(contentsOf: file(for: d), encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap {
+            (try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any]).flatMap { LogEvent(json: $0) }
+        }
+    }
+
+    // 파일 이름의 날짜로 판단해 오래된 것을 지운다 (수정 시각은 백업·복사로 바뀔 수 있음)
+    static func prune(now: Date = Date()) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return }
+        let cutoff = now.addingTimeInterval(-Double(keepDays) * 86400)
+        for n in names where n.hasSuffix(".jsonl") {
+            if let d = day.date(from: String(n.dropLast(6))), d < cutoff {
+                try? FileManager.default.removeItem(at: dir.appendingPathComponent(n))
+            }
+        }
+    }
+}
+
 // 살아 있는 세션 하나 (사무실 모드의 책상 하나)
 struct LiveSession {
     let id: String
@@ -584,6 +686,7 @@ struct LiveSession {
     let busy: Bool           // sessions/<pid>.json 의 status == "busy"
     let startedAt: Double
     var statusSince: Double = 0   // 지금 상태(busy/idle)가 된 시각 (ms) — 얼마나 오래 쉬었는지
+    var kind = ""                 // interactive / bg (claude --bg 로 띄운 백그라운드 세션)
     var question = false     // AskUserQuestion 에 아직 답이 없음
 }
 
@@ -621,6 +724,18 @@ final class Tracker {
     private var lastRegistryScan = Date.distantPast
     private var liveInfo: [LiveSession] = []
 
+    // 로그: 앱을 켠 뒤 새로 생긴 사건만 모았다가 drainLog() 로 넘긴다
+    private(set) var pendingLog: [LogEvent] = []
+    private var registryPrimed = false
+    private var pendingStartSeen = false   // 첫 poll 에서 이미 퇴근 상태인 세션은 기록하지 않는다
+    private var knownSessions: [String: String] = [:]
+    private var awaySessions: Set<String> = []
+    private var recentMessages: [String: Date] = [:]   // 같은 메시지가 몇 초 안에 반복되면 한 번으로
+    func drainLog() -> [LogEvent] { defer { pendingLog = [] }; return pendingLog }
+    private func log(_ type: String, session: String, sid: String, _ extra: [String: Any] = [:], at: Date = Date()) {
+        pendingLog.append(LogEvent(at: at, type: type, session: session, sid: sid, extra: extra))
+    }
+
     init(config: Config) { self.config = config }
 
     var running: [BgTask] {
@@ -635,6 +750,20 @@ final class Tracker {
         var out: [Finished] = []
         for w in watches.values { out += read(w) }
         live = liveInfo.map { var l = $0; l.question = !(watches[l.id]?.asks.isEmpty ?? true); return l }
+        let nowS = Date().timeIntervalSince1970
+        for l in live {
+            let tasks = watches[l.id]?.running.count ?? 0
+            let idle = l.statusSince > 0 ? nowS - l.statusSince / 1000 : 0
+            let away = !l.busy && !l.question && tasks == 0 && l.statusSince > 0 && idle > config.leaveAfterMinutes * 60
+            if away && !awaySessions.contains(l.id) {
+                awaySessions.insert(l.id)
+                if registryPrimed && knownSessions[l.id] != nil && pendingStartSeen { log("away", session: l.name, sid: l.id, ["idle_min": Int(idle / 60)]) }
+            } else if !away && awaySessions.contains(l.id) {
+                awaySessions.remove(l.id)
+                log("back", session: l.name, sid: l.id)
+            }
+        }
+        pendingStartSeen = true
         let cutoff = Date().addingTimeInterval(-config.maxTaskHours * 3600)
         for w in watches.values {
             w.running = w.running.filter { $0.value.startedAt > cutoff }
@@ -651,7 +780,7 @@ final class Tracker {
     func scanRegistry() {
         lastRegistryScan = Date()
         let dir = config.claudeRoot.appendingPathComponent("sessions")
-        var live: [String: (name: String, version: String, busy: Bool, startedAt: Double, since: Double)] = [:]
+        var live: [String: (name: String, version: String, busy: Bool, startedAt: Double, since: Double, kind: String)] = [:]
         for f in (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [] where f.hasSuffix(".json") {
             guard let d = try? Data(contentsOf: dir.appendingPathComponent(f)),
                   let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
@@ -660,13 +789,28 @@ final class Tracker {
             let cwdName = (j["cwd"] as? String).map { ($0 as NSString).lastPathComponent } ?? "세션"
             live[sid] = ((j["name"] as? String) ?? cwdName, (j["version"] as? String) ?? "",
                          (j["status"] as? String) == "busy", (j["startedAt"] as? Double) ?? 0,
-                         (j["statusUpdatedAt"] as? Double) ?? (j["updatedAt"] as? Double) ?? 0)
+                         (j["statusUpdatedAt"] as? Double) ?? (j["updatedAt"] as? Double) ?? 0, (j["kind"] as? String) ?? "")
         }
         liveSessions = live.count
         versions = Array(Set(live.values.map(\.version).filter { !$0.isEmpty })).sorted()
         // 세션이 끝나면 남은 작업도 조용히 치운다 — 결과를 받을 쪽이 없다
         for sid in Array(watches.keys) where live[sid] == nil { watches.removeValue(forKey: sid) }
-        liveInfo = live.map { LiveSession(id: $0.key, name: $0.value.name, busy: $0.value.busy, startedAt: $0.value.startedAt, statusSince: $0.value.since) }
+        liveInfo = live.map { LiveSession(id: $0.key, name: $0.value.name, busy: $0.value.busy, startedAt: $0.value.startedAt, statusSince: $0.value.since, kind: $0.value.kind) }
+        // 출근·종료 기록 (앱을 켠 뒤 처음 훑을 때는 기록하지 않고 시작 한 줄만)
+        let names = Dictionary(uniqueKeysWithValues: live.map { ($0.key, $0.value.name) })
+        if registryPrimed {
+            for (sid, info) in live where knownSessions[sid] == nil {
+                log("arrive", session: info.name, sid: sid, ["kind": info.kind])
+            }
+            for (sid, name) in knownSessions where live[sid] == nil {
+                log("end", session: name, sid: sid)
+                awaySessions.remove(sid)
+            }
+        } else {
+            log("start", session: "BG Buddy", sid: "", ["count": live.count])
+            registryPrimed = true
+        }
+        knownSessions = names
         for (sid, info) in live {
             if let w = watches[sid] { w.name = info.name; continue }
             if let url = findTranscript(sid) {
@@ -715,6 +859,7 @@ final class Tracker {
     }
 
     private static let pNote = Data("<task-notification>".utf8)
+    private static let pMsg = Data("<cross-session-message".utf8)
     private static let pToolUse = Data("\"tool_use\"".utf8)
     private static let pResult = Data("\"toolUseResult\"".utf8)
 
@@ -722,7 +867,8 @@ final class Tracker {
         let hasNote = line.range(of: Self.pNote) != nil
         let hasUse = line.range(of: Self.pToolUse) != nil
         let hasResult = line.range(of: Self.pResult) != nil
-        guard hasNote || hasUse || hasResult,
+        let hasMsg = live && line.range(of: Self.pMsg) != nil
+        guard hasNote || hasUse || hasResult || hasMsg,
               let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return [] }
         let ts = Self.date(j["timestamp"] as? String)
         var out: [Finished] = []
@@ -749,20 +895,46 @@ final class Tracker {
             }
         }
 
+        // 세션 간 메시지: 받는 쪽 기록의 큐 등록(enqueue)만 쓴다 — 같은 메시지가 사용자 메시지로 한 번 더 남는다.
+        // 보낸 세션은 from 의 소켓 경로 안 PID, 받은 세션은 이 기록의 주인. 본문은 첫 줄만 남긴다
+        if hasMsg, (j["type"] as? String) == "queue-operation", (j["operation"] as? String) == "enqueue",
+           let c = j["content"] as? String, c.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<cross-session-message") {
+            let head = c.components(separatedBy: ">").first ?? ""
+            func attr(_ k: String) -> String? {
+                guard let r = head.range(of: "\(k)=\"") else { return nil }
+                return head[r.upperBound...].components(separatedBy: "\"").first
+            }
+            let from = attr("from") ?? ""
+            let pid = from.components(separatedBy: "/").last?.replacingOccurrences(of: ".sock", with: "") ?? ""
+            let fromName = attr("from-name") ?? (pid.isEmpty ? "다른 세션" : "pid \(pid)")
+            let body = c.drop(while: { $0 != ">" }).dropFirst()
+            let first = body.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty && !$0.hasPrefix("</") } ?? ""
+            let text = first.count > 120 ? String(first.prefix(119)) + "…" : first
+            let key = fromName + "→" + w.sessionId + ":" + text
+            let at = ts ?? Date()
+            if let prev = recentMessages[key], abs(at.timeIntervalSince(prev)) < 30 { } else {
+                recentMessages[key] = at
+                log("message", session: fromName, sid: "", ["to": w.name, "to_sid": w.sessionId, "from_pid": pid, "text": text], at: at)
+            }
+            if recentMessages.count > 200 { recentMessages = recentMessages.filter { at.timeIntervalSince($0.value) < 300 } }
+        }
+
         let blocks = ((j["message"] as? [String: Any])?["content"] as? [[String: Any]]) ?? []
         for b in blocks {
             switch b["type"] as? String {
-            case "tool_use": toolUse(b, w)
+            case "tool_use": toolUse(b, w, live: live, ts: ts)
             case "tool_result":
-                if let id = b["tool_use_id"] as? String { w.asks.remove(id) }
-                if let r = j["toolUseResult"] as? [String: Any] { toolResult(b, r, ts: ts, w, sessionId: w.sessionId) }
+                if let id = b["tool_use_id"] as? String, w.asks.remove(id) != nil, live {
+                    log("answer", session: w.name, sid: w.sessionId, at: ts ?? Date())
+                }
+                if let r = j["toolUseResult"] as? [String: Any] { toolResult(b, r, ts: ts, w, sessionId: w.sessionId, live: live) }
             default: break
             }
         }
         return out
     }
 
-    private func toolUse(_ b: [String: Any], _ w: SessionWatch) {
+    private func toolUse(_ b: [String: Any], _ w: SessionWatch, live: Bool = false, ts: Date? = nil) {
         guard let id = b["id"] as? String, let name = b["name"] as? String else { return }
         let input = b["input"] as? [String: Any] ?? [:]
         if ["TaskStop", "KillShell", "KillBash"].contains(name) {
@@ -773,13 +945,20 @@ final class Tracker {
             }
             return
         }
-        if name == "AskUserQuestion" { w.asks.insert(id) }
+        if name == "AskUserQuestion" {
+            w.asks.insert(id)
+            if live {
+                // 질문 내용 대신 짧은 꼬리표(header)만 남긴다
+                let header = ((input["questions"] as? [[String: Any]])?.first?["header"] as? String) ?? ""
+                log("ask", session: w.name, sid: w.sessionId, header.isEmpty ? [:] : ["header": header], at: ts ?? Date())
+            }
+        }
         var label = (input["description"] as? String) ?? ""
         if label.isEmpty, let c = input["command"] as? String { label = String(c.prefix(40)) }
         w.tools[id] = (name, label.isEmpty ? name : label)
     }
 
-    private func toolResult(_ b: [String: Any], _ r: [String: Any], ts: Date?, _ w: SessionWatch, sessionId: String) {
+    private func toolResult(_ b: [String: Any], _ r: [String: Any], ts: Date?, _ w: SessionWatch, sessionId: String, live: Bool = false) {
         guard let id = b["tool_use_id"] as? String else { return }
         let tool = w.tools.removeValue(forKey: id)
         guard !w.ended.contains(id), w.running[id] == nil else { return }
@@ -795,6 +974,7 @@ final class Tracker {
                                label: label, sessionName: w.name, startedAt: ts ?? Date(),
                                outputFile: Self.outputFile(r, b, taskId: tid, sessionId: sessionId))
         w.starts += 1
+        if live { log("task_start", session: w.name, sid: w.sessionId, ["kind": w.running[id]!.kind, "label": label], at: ts ?? Date()) }
     }
 
     // 출력 파일 위치: Agent 는 결과에 outputFile, Bash 는 결과 문구의 "Output is being written to: …"
@@ -1372,6 +1552,106 @@ final class BuddyView: NSView {
     override func rightMouseDown(with e: NSEvent) { onMenu?(e) }
 }
 
+// 로그 창: 메뉴의 "로그 보기…". 고른 날의 기록을 보여주고, 오늘이면 새 사건을 바로 붙인다
+final class LogWindowController: NSObject, NSWindowDelegate {
+    let window: NSWindow
+    private let text = NSTextView()
+    private let filter = NSPopUpButton()
+    private let dayPicker = NSDatePicker()
+    private let count = NSTextField(labelWithString: "")
+    private var events: [LogEvent] = []
+    private var shownDay = Date()
+
+    override init() {
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 440),
+                          styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        super.init()
+        window.title = "BG Buddy 로그"
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.center()
+
+        dayPicker.datePickerStyle = .textFieldAndStepper
+        dayPicker.datePickerElements = .yearMonthDay
+        dayPicker.dateValue = Date()
+        dayPicker.target = self; dayPicker.action = #selector(dayChanged)
+        filter.target = self; filter.action = #selector(redraw)
+        let folder = NSButton(title: "로그 폴더 열기", target: self, action: #selector(openFolder))
+        count.textColor = .secondaryLabelColor
+        let bar = NSStackView(views: [dayPicker, filter, count, NSView(), folder])
+        bar.orientation = .horizontal; bar.spacing = 8
+        bar.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        bar.setHuggingPriority(.defaultLow, for: .horizontal)
+
+        text.isEditable = false
+        text.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        text.textContainerInset = NSSize(width: 8, height: 8)
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.documentView = text
+        text.autoresizingMask = [.width]
+        text.isVerticallyResizable = true
+        text.textContainer?.widthTracksTextView = true
+
+        let root = NSStackView(views: [bar, scroll])
+        root.orientation = .vertical; root.spacing = 0
+        root.setHuggingPriority(.defaultLow, for: .vertical)
+        window.contentView = root
+        load()
+    }
+
+    func show() {
+        if Calendar.current.isDateInToday(dayPicker.dateValue) == false && Calendar.current.isDateInToday(shownDay) { dayPicker.dateValue = Date() }
+        load()
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    // 새 사건: 보고 있는 날이 오늘이면 바로 붙인다
+    func add(_ new: [LogEvent]) {
+        guard window.isVisible, Calendar.current.isDate(shownDay, inSameDayAs: Date()) else { return }
+        events += new
+        rebuildFilter(); redraw()
+    }
+
+    private func load() {
+        shownDay = dayPicker.dateValue
+        events = EventLog.read(day: shownDay)
+        rebuildFilter(); redraw()
+    }
+
+    private func rebuildFilter() {
+        let current = filter.titleOfSelectedItem
+        var names = Set(events.map(\.session))
+        for e in events where e.type == "message" { if let to = e.extra["to"] as? String { names.insert(to) } }
+        names.remove("BG Buddy")
+        filter.removeAllItems()
+        filter.addItem(withTitle: "모든 세션")
+        filter.addItems(withTitles: names.sorted())
+        if let c = current, filter.itemTitles.contains(c) { filter.selectItem(withTitle: c) }
+    }
+
+    @objc private func dayChanged() { load() }
+
+    @objc private func redraw() {
+        let pick = filter.indexOfSelectedItem > 0 ? filter.titleOfSelectedItem : nil
+        let shown = events.filter { e in
+            guard let p = pick else { return true }
+            return e.session == p || (e.extra["to"] as? String) == p
+        }
+        let body = shown.isEmpty ? "(기록 없음)\n\n위치: \(EventLog.dir.path)" : shown.map(\.line).joined(separator: "\n")
+        let atBottom = (text.enclosingScrollView?.verticalScroller?.floatValue ?? 1) > 0.98
+        text.string = body
+        count.stringValue = "\(shown.count)건"
+        if atBottom { text.scrollToEndOfDocument(nil) }
+    }
+
+    @objc private func openFolder() {
+        try? FileManager.default.createDirectory(at: EventLog.dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(EventLog.dir)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var panel: NSPanel!
     var statusItem: NSStatusItem?
@@ -1381,6 +1661,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var view: BuddyView!
     var office: OfficeView?
     var live: [LiveSession] = []
+    var logWindow: LogWindowController?
+    var lastPrune = ""
     var config = Config.load()
     var tracker: Tracker!
     let queue = DispatchQueue(label: "bgbuddy.tracker")
@@ -1516,8 +1798,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let events = self.tracker.poll()
             let running = self.tracker.running
             let live = self.tracker.live
-            DispatchQueue.main.async { self.live = live; self.apply(running, events); self.polling = false }
+            let logs = self.tracker.drainLog()
+            DispatchQueue.main.async { self.live = live; self.record(logs, events); self.apply(running, events); self.polling = false }
         }
+    }
+
+    // 사건을 파일에 쓰고 로그 창에도 붙인다. 백그라운드 작업 끝은 Finished 에서 만든다
+    func record(_ logs: [LogEvent], _ finished: [Finished]) {
+        var all = logs
+        for f in finished {
+            var x: [String: Any] = ["status": f.status, "label": f.label, "kind": f.kind]
+            if let st = f.startedAt { x["dur"] = Int(f.at.timeIntervalSince(st)) }
+            all.append(LogEvent(at: f.at, type: "task_end", session: f.sessionName, sid: f.sessionId, extra: x))
+        }
+        all.sort { $0.at < $1.at }
+        EventLog.append(all)
+        logWindow?.add(all)
+        let today = EventLog.day.string(from: Date())
+        if today != lastPrune { lastPrune = today; EventLog.prune() }
+    }
+
+    @objc func showLog() {
+        if logWindow == nil { logWindow = LogWindowController() }
+        logWindow?.show()
     }
 
     func apply(_ running: [BgTask], _ events: [Finished]) {
@@ -1723,6 +2026,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let icon = NSMenuItem(title: "메뉴 막대 아이콘", action: #selector(toggleIcon), keyEquivalent: "")
         icon.target = self; icon.state = config.menuBarIcon ? .on : .off
         menu.addItem(icon)
+        let logItem = NSMenuItem(title: "로그 보기…", action: #selector(showLog), keyEquivalent: "")
+        logItem.target = self
+        menu.addItem(logItem)
         let test = NSMenuItem(title: "말풍선 테스트", action: #selector(testBubble), keyEquivalent: "")
         test.target = self; test.isEnabled = config.visible
         menu.addItem(test)
@@ -1874,6 +2180,20 @@ enum CLI {
                 post("local.bgbuddy.reload", nil); return 0
             case "--quit":
                 post("local.bgbuddy.quit", nil); return 0
+            case "--log":
+                var day = Date()
+                if let i = args.firstIndex(of: "--date"), i + 1 < args.count {
+                    guard let d = EventLog.day.date(from: args[i + 1]) else { throw BuddyError("날짜 형식: YYYY-MM-DD") }
+                    day = d
+                }
+                let who = args.firstIndex(of: "--session").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+                let evs = EventLog.read(day: day).filter { e in
+                    guard let w = who else { return true }
+                    return e.session == w || (e.extra["to"] as? String) == w
+                }
+                print("\(EventLog.day.string(from: day)) · \(evs.count)건 · \(EventLog.file(for: day).path)")
+                for e in evs { print(e.line) }
+                return 0
             case "--render-office":
                 // 확인용: 지금 세션 상태로 사무실 화면을 PNG 로 그린다 (Retina 2배)
                 guard args.count > 1 else { throw BuddyError("사용법: --render-office <출력.png> [done|failed|away|demo]") }
@@ -1931,7 +2251,7 @@ enum CLI {
                 post("local.bgbuddy.reload", nil)
                 return 0
             default:
-                print("사용법: BgBuddy [--tasks [--debug] | --doctor | --characters | --check-character 이름 | --import 이미지 이름 | --poke 종류 | --reload | --quit | --set 키 값]")
+                print("사용법: BgBuddy [--tasks [--debug] | --doctor | --characters | --check-character 이름 | --import 이미지 이름 | --poke 종류 | --reload | --quit | --log [--date D] [--session S] | --set 키 값]")
                 return 2
             }
         } catch {

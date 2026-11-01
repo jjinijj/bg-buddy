@@ -18,3 +18,4 @@ rm -rf "$DEST"
 rm -f "$HOME/.local/bin/buddy"
 defaults delete local.bgbuddy 2>/dev/null || true
 echo "제거 완료."
+[ -d "$HOME/Library/Logs/BgBuddy" ] && echo "사건 기록은 남겨 두었습니다: $HOME/Library/Logs/BgBuddy (필요 없으면 직접 지우세요)"
