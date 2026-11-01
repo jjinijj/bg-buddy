@@ -1876,7 +1876,7 @@ enum CLI {
                 post("local.bgbuddy.quit", nil); return 0
             case "--render-office":
                 // 확인용: 지금 세션 상태로 사무실 화면을 PNG 로 그린다 (Retina 2배)
-                guard args.count > 1 else { throw BuddyError("사용법: --render-office <출력.png> [test]") }
+                guard args.count > 1 else { throw BuddyError("사용법: --render-office <출력.png> [done|failed|away|demo]") }
                 let c = Config.load()
                 let v = OfficeView(pack: try OfficePack.load(size: c.size))
                 let t = Tracker(config: c); _ = t.poll()
@@ -1889,8 +1889,26 @@ enum CLI {
                                     statusSince: (Date().timeIntervalSince1970 - 3600) * 1000)
                     }
                 }
-                v.update(live: lv, tasks: [], events: [], visible: true)
-                if args.count > 2 && args[2] != "away" { v.test(args[2]) }
+                if args.count > 2 && args[2] == "demo" {
+                    // README 용: 실제 세션 이름이 들어가지 않게 가짜 세션으로 그린다
+                    let now = Date(), ms = { (ago: Double) in (now.timeIntervalSince1970 - ago) * 1000 }
+                    let demo = [
+                        LiveSession(id: "demo-a", name: "my-app", busy: true, startedAt: ms(3000), statusSince: ms(20)),
+                        LiveSession(id: "demo-b", name: "api-server", busy: false, startedAt: ms(2800), statusSince: ms(60), question: true),
+                        LiveSession(id: "demo-c", name: "docs", busy: false, startedAt: ms(2600), statusSince: ms(300)),
+                        LiveSession(id: "demo-d", name: "data-pipeline", busy: false, startedAt: ms(2400), statusSince: ms(7200)),
+                        LiveSession(id: "demo-e", name: "scratch", busy: false, startedAt: ms(2200), statusSince: ms(9000)),
+                    ]
+                    let tasks = [BgTask(key: "t1", sessionId: "demo-a", taskId: "t1", kind: "bash", label: "테스트 실행", sessionName: "my-app", startedAt: now.addingTimeInterval(-90)),
+                                 BgTask(key: "t2", sessionId: "demo-c", taskId: "t2", kind: "agent", label: "문서 정리", sessionName: "docs", startedAt: now.addingTimeInterval(-40))]
+                    v.update(live: demo, tasks: tasks, events: [], visible: true)
+                    let done = Finished(sessionId: "demo-a", label: "빌드", kind: "bash", status: "completed", sessionName: "my-app",
+                                        startedAt: now.addingTimeInterval(-133), at: now)
+                    v.update(live: demo, tasks: tasks, events: [done], visible: true)
+                } else {
+                    v.update(live: lv, tasks: [], events: [], visible: true)
+                    if args.count > 2 && args[2] != "away" { v.test(args[2]) }
+                }
                 v.tick(Date())
                 let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(v.bounds.width * 2), pixelsHigh: Int(v.bounds.height * 2),
                                            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -1902,7 +1920,7 @@ enum CLI {
                 v.draw(v.bounds)
                 NSGraphicsContext.restoreGraphicsState()
                 try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: args[1]))
-                print("세션 \(t.live.count)개 → 책상 \(v.shown.count)개" + (v.overflow > 0 ? " (+\(v.overflow))" : "") + " · 창 \(Int(v.bounds.width))×\(Int(v.bounds.height))pt")
+                print("세션 \(v.seats.count)개 → 책상 \(v.shown.count)개" + (v.overflow > 0 ? " (+\(v.overflow))" : "") + " · 창 \(Int(v.bounds.width))×\(Int(v.bounds.height))pt")
                 for st in v.shown { print("  \(st.name): " + (st.question ? "질문 대기" : st.busy ? "작업 중" : st.away ? "퇴근 (\(Int(st.idleMinutes))분째 쉼)" : "쉬는 중 (\(Int(st.idleMinutes))분째)") + (st.tasks > 0 ? " · 백그라운드 \(st.tasks)" : "")) }
                 return 0
             case "--set":
