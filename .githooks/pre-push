@@ -1,0 +1,3 @@
+#!/bin/bash
+# 켜려면: git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/tools/preflight.sh"
