@@ -743,6 +743,7 @@ final class Tracker {
     private var knownSessions: [String: String] = [:]
     private var awaySessions: Set<String> = []
     private var stuckLogged: Set<String> = []
+    private var pidToSession: [String: String] = [:]   // 메시지의 보낸 쪽(소켓 경로 속 PID) → 세션 ID
     private var recentMessages: [String: Date] = [:]   // 같은 메시지가 몇 초 안에 반복되면 한 번으로
     func drainLog() -> [LogEvent] { defer { pendingLog = [] }; return pendingLog }
     private func log(_ type: String, session: String, sid: String, _ extra: [String: Any] = [:], at: Date = Date()) {
@@ -824,6 +825,7 @@ final class Tracker {
                   let pid = (j["pid"] as? NSNumber)?.int32Value, let sid = j["sessionId"] as? String,
                   kill(pid, 0) == 0 || errno == EPERM else { continue }
             let cwdName = (j["cwd"] as? String).map { ($0 as NSString).lastPathComponent } ?? "세션"
+            pidToSession[String(pid)] = sid
             live[sid] = ((j["name"] as? String) ?? cwdName, (j["version"] as? String) ?? "",
                          (j["status"] as? String) == "busy", (j["startedAt"] as? Double) ?? 0,
                          (j["statusUpdatedAt"] as? Double) ?? (j["updatedAt"] as? Double) ?? 0, (j["kind"] as? String) ?? "")
@@ -967,7 +969,7 @@ final class Tracker {
             let at = ts ?? Date()
             if let prev = recentMessages[key], abs(at.timeIntervalSince(prev)) < 30 { } else {
                 recentMessages[key] = at
-                log("message", session: fromName, sid: "", ["to": w.name, "to_sid": w.sessionId, "from_pid": pid, "text": text], at: at)
+                log("message", session: fromName, sid: pidToSession[pid] ?? "", ["to": w.name, "to_sid": w.sessionId, "from_pid": pid, "text": text], at: at)
             }
             if recentMessages.count > 200 { recentMessages = recentMessages.filter { at.timeIntervalSince($0.value) < 300 } }
         }
@@ -1233,6 +1235,7 @@ final class Seat {
     var slow: Bool { busy && pendingSecs > LiveSession.slowSeconds && !stuck }
     var leaving: Date?                          // 퇴근하며 걸어 나가는 중 (책상은 남김)
     var idleMinutes = 0.0
+    var lastMessage: (from: String, text: String, at: Date)?   // 마지막으로 받은 세션 간 메시지
     init(id: String, name: String, variant: Int, startedAt: Double) {
         self.id = id; self.name = name; self.variant = variant; self.startedAt = startedAt
     }
@@ -1265,6 +1268,19 @@ final class OfficeView: NSView {
     private var bubbleRect: NSRect?
     var bubbleSeconds = 15.0
     var leaveAfter = 30.0 * 60
+
+    // 세션 간 메시지: 보낸 책상 → 받은 책상으로 봉투가 포물선을 그리며 날아간다
+    struct Flight { let from: String?; let to: String; let start: Date }
+    static let flightTime = 1.4, landTime = 1.2
+    private var flights: [Flight] = []
+
+    func message(fromSid: String?, toSid: String, fromName: String, text: String, at: Date = Date()) {
+        seats[toSid]?.lastMessage = (fromName, text, at)
+        // 받는 책상이 화면에 없으면 장면은 생략 (기록에는 남는다)
+        guard shown.contains(where: { $0.id == toSid }) else { return }
+        flights.append(Flight(from: fromSid, to: toSid, start: at))
+        if flights.count > 8 { flights.removeFirst(flights.count - 8) }
+    }
 
     var onMenu: ((NSEvent) -> Void)?
     var onMoved: (() -> Void)?
@@ -1359,6 +1375,11 @@ final class OfficeView: NSView {
 
     func showInfo(_ s: Seat) {
         var body = s.stateText
+        if let m = s.lastMessage, Date().timeIntervalSince(m.at) < 3600 {
+            current = (s.id, Bubble(title: s.name, body: body + (s.tasks > 0 ? " · 백그라운드 \(s.tasks)개" : ""),
+                                    sub: "✉ \(m.from): \(m.text)", seconds: 5), Date())
+            return
+        }
         if s.tasks > 0 { body += " · 백그라운드 \(s.tasks)개" }
         current = (s.id, Bubble(title: s.name, body: body, sub: "", seconds: 4), Date())
     }
@@ -1372,7 +1393,7 @@ final class OfficeView: NSView {
                tasks: [], events: [f], visible: true)
     }
 
-    var idle: Bool { current == nil && bubbles.isEmpty && !seats.values.contains { $0.busy || $0.question || $0.walkIn != nil || $0.walkOut != nil || $0.leaving != nil || $0.tasks > 0 } }
+    var idle: Bool { current == nil && bubbles.isEmpty && flights.isEmpty && !seats.values.contains { $0.busy || $0.question || $0.walkIn != nil || $0.walkOut != nil || $0.leaving != nil || $0.tasks > 0 } }
 
     func tick(_ now: Date) {
         var changed = false
@@ -1383,6 +1404,7 @@ final class OfficeView: NSView {
             if let w = s.walkOut, now.timeIntervalSince(w) > OfficeView.walkTime { seats.removeValue(forKey: s.id); changed = true }
         }
         if changed { relayout() }
+        flights.removeAll { now.timeIntervalSince($0.start) > OfficeView.flightTime + OfficeView.landTime }
         if current == nil, !bubbles.isEmpty { let b = bubbles.removeFirst(); current = (b.seat, b.bubble, now) }
         if let c = current {
             let limit = c.bubble.seconds ?? bubbleSeconds
@@ -1477,6 +1499,50 @@ final class OfficeView: NSView {
             bubbleRect = renderBubble(c.bubble, tailX: slotX(i) + pack.slotW / 2, baseY: top, in: bounds,
                                       maxHeight: OfficeView.bubbleArea - 12, queued: bubbles.count)
         }
+        drawFlights(now)   // 말풍선 위로 — 가려지지 않게
+    }
+
+    // 책상 위쪽(머리 위) 한 점
+    private func headPoint(_ id: String) -> NSPoint? {
+        guard let i = shown.firstIndex(where: { $0.id == id }) else { return nil }
+        return NSPoint(x: slotX(i) + pack.slotW * 0.55, y: floorY + pack.heightPt * 0.85)
+    }
+
+    private func drawFlights(_ now: Date) {
+        for f in flights {
+            guard let end = headPoint(f.to) else { continue }
+            // 보낸 책상이 화면에 없으면(+N 이거나 모르는 세션) 오른쪽 끝에서 날아온다
+            let start = f.from.flatMap { headPoint($0) } ?? NSPoint(x: bounds.width - 10, y: end.y + 10)
+            let t = now.timeIntervalSince(f.start)
+            var p = end, scale: CGFloat = 1, alpha: CGFloat = 1
+            if t < OfficeView.flightTime {
+                let u = CGFloat(t / OfficeView.flightTime)
+                let e = u < 0.5 ? 2 * u * u : 1 - pow(-2 * u + 2, 2) / 2        // 천천히 출발해 천천히 도착
+                let lift = max(18, abs(end.x - start.x) * 0.35)                  // 멀수록 높게
+                p = NSPoint(x: start.x + (end.x - start.x) * e, y: start.y + (end.y - start.y) * e + lift * sin(.pi * e))
+                scale = 1 + 0.25 * sin(.pi * u)
+            } else {
+                // 도착: 받은 책상 위에 잠깐 머물다 옅어진다
+                let u = CGFloat((t - OfficeView.flightTime) / OfficeView.landTime)
+                alpha = max(0, 1 - u * u)
+                p.y += 2 * sin(.pi * u)
+            }
+            drawEnvelope(at: p, scale: scale, alpha: alpha)
+        }
+    }
+
+    private func drawEnvelope(at c: NSPoint, scale k: CGFloat, alpha: CGFloat) {
+        let w = 13 * k, h = 9 * k
+        let r = NSRect(x: c.x - w / 2, y: c.y - h / 2, width: w, height: h)
+        NSColor(white: 1, alpha: alpha).setFill()
+        NSColor(white: 0.15, alpha: alpha).setStroke()
+        let body = NSBezierPath(roundedRect: r, xRadius: 1.5, yRadius: 1.5)
+        body.lineWidth = 1.2; body.fill(); body.stroke()
+        let flap = NSBezierPath()
+        flap.move(to: NSPoint(x: r.minX + 0.8, y: r.maxY - 0.8))
+        flap.line(to: NSPoint(x: r.midX, y: r.midY - h * 0.08))
+        flap.line(to: NSPoint(x: r.maxX - 0.8, y: r.maxY - 0.8))
+        flap.lineWidth = 1.1; flap.stroke()
     }
 
     func seat(at p: NSPoint) -> Seat? { seatRects.first { $0.1.insetBy(dx: -2, dy: -2).contains(p) }?.0 }
@@ -1487,7 +1553,9 @@ final class OfficeView: NSView {
 
     func tooltip(at p: NSPoint) -> String? {
         guard let s = seat(at: p) else { return nil }
-        return s.name + " · " + s.stateText + (s.tasks > 0 ? " · 백그라운드 \(s.tasks)개" : "")
+        var t = s.name + " · " + s.stateText + (s.tasks > 0 ? " · 백그라운드 \(s.tasks)개" : "")
+        if let m = s.lastMessage { t += "\n✉ \(EventLog.clock.string(from: m.at)) \(m.from): \(m.text)" }
+        return t
     }
 
     private var dragStart: NSPoint?, originStart: NSPoint?, dragged = false
@@ -1891,6 +1959,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         all.sort { $0.at < $1.at }
         EventLog.append(all)
+        if officeMode, let o = office {
+            for e in all where e.type == "message" {
+                guard let to = e.extra["to_sid"] as? String else { continue }
+                o.message(fromSid: e.sid.isEmpty ? nil : e.sid, toSid: to, fromName: e.session,
+                          text: (e.extra["text"] as? String) ?? "", at: e.at)
+            }
+        }
         logWindow?.add(all)
         let today = EventLog.day.string(from: Date())
         if today != lastPrune { lastPrune = today; EventLog.prune() }
@@ -2314,6 +2389,8 @@ enum CLI {
                     let done = Finished(sessionId: "demo-a", label: "빌드", kind: "bash", status: "completed", sessionName: "my-app",
                                         startedAt: now.addingTimeInterval(-133), at: now)
                     v.update(live: demo, tasks: tasks, events: [done], visible: true)
+                    // 날아가는 중간 순간과, 막 도착한 순간
+                    v.message(fromSid: "demo-c", toSid: "demo-b", fromName: "docs", text: "[pm-dev-pipeline] 문서 정리 완료", at: now.addingTimeInterval(-0.7))
                 } else {
                     v.update(live: lv, tasks: [], events: [], visible: true)
                     if args.count > 2 && args[2] != "away" { v.test(args[2]) }
