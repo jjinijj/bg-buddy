@@ -1413,7 +1413,10 @@ final class OfficeView: NSView {
         needsDisplay = true
     }
 
-    private func slotX(_ i: Int) -> CGFloat { OfficeView.margin + CGFloat(i) * (pack.slotW + OfficeView.gap) }
+    // 사무실은 오른쪽에서 왼쪽으로 늘어난다: 먼저 출근한 사람이 맨 오른쪽, 새로 온 사람은 그 왼쪽.
+    // 맨 오른쪽 책상 옆에 설 에이전트 자리만큼 오른쪽을 비워 둔다. +N 은 왼쪽 끝에.
+    private var rightStart: CGFloat { bounds.width - OfficeView.margin - pack.slotW * 0.45 - pack.slotW }
+    private func slotX(_ i: Int) -> CGFloat { rightStart - CGFloat(i) * (pack.slotW + OfficeView.gap) }
     private let floorY: CGFloat = 6
 
     private func frameRect(_ s: Seat, x: CGFloat, image: CGImage, scale k: CGFloat = 1) -> NSRect {
@@ -1436,26 +1439,27 @@ final class OfficeView: NSView {
         let now = Date()
         // 바닥: 앉은 사람 수만큼의 옅은 띠
         if !shown.isEmpty {
-            let w = CGFloat(shown.count) * (pack.slotW + OfficeView.gap) - OfficeView.gap
+            let left = slotX(shown.count - 1), right = slotX(0) + pack.slotW
             NSColor(white: 0.5, alpha: 0.16).setFill()
-            NSBezierPath(roundedRect: NSRect(x: OfficeView.margin - 3, y: 1, width: w + 6, height: floorY + pack.heightPt * 0.18), xRadius: 6, yRadius: 6).fill()
+            NSBezierPath(roundedRect: NSRect(x: left - 3, y: 1, width: right - left + 6, height: floorY + pack.heightPt * 0.18), xRadius: 6, yRadius: 6).fill()
         }
         for (i, s) in shown.enumerated() {
             let v = pack.variants[s.variant]
             let x = slotX(i)
             if let start = s.walkIn ?? s.walkOut ?? s.leaving {
-                // 출근·퇴근: 빈 책상 + 걷는 사람. 들어올 때는 오른쪽 끝에서 왼쪽으로(좌우 반전), 나갈 때는 오른쪽으로
+                // 출근·퇴근: 빈 책상 + 걷는 사람. 빈 공간인 왼쪽 끝에서 걸어 들어오고(그림 그대로 오른쪽을 봄),
+                // 나갈 때는 왼쪽으로 걸어 나간다(좌우 반전)
                 let empty = v.frames[pack.frames("empty")[0]]
                 ctx.draw(empty, in: frameRect(s, x: x, image: empty))
                 let t = min(1, now.timeIntervalSince(start) / OfficeView.walkTime)
                 let walker = v.frames[cycle("walk", start)]
                 let wr = frameRect(s, x: x, image: walker, scale: 0.92)
-                let far = bounds.width - wr.width - 2, near = wr.minX
+                let far: CGFloat = 2, near = wr.minX
                 let coming = s.walkIn != nil && s.leaving == nil
                 let wx = coming ? far + (near - far) * CGFloat(t) : near + (far - near) * CGFloat(t)
                 let r = NSRect(x: wx, y: wr.minY, width: wr.width, height: wr.height)
                 // 출근·복귀 중에 퇴근 상태가 되면 걸어 나가는 쪽으로 그린다
-                if s.walkIn != nil && s.leaving == nil {
+                if !coming {
                     ctx.saveGState(); ctx.translateBy(x: r.midX, y: 0); ctx.scaleBy(x: -1, y: 1); ctx.translateBy(x: -r.midX, y: 0)
                     ctx.draw(walker, in: r); ctx.restoreGState()
                 } else { ctx.draw(walker, in: r) }
@@ -1491,7 +1495,8 @@ final class OfficeView: NSView {
         }
         if overflow > 0 {
             let t = NSAttributedString(string: "+\(overflow)", attributes: [.font: NSFont.boldSystemFont(ofSize: 11), .foregroundColor: NSColor(white: 0.35, alpha: 1)])
-            t.draw(at: NSPoint(x: slotX(shown.count) + 2, y: floorY + 4))
+            let edge = shown.isEmpty ? rightStart + pack.slotW : slotX(shown.count - 1)
+            t.draw(at: NSPoint(x: edge - t.size().width - 4, y: floorY + 4))
         }
         bubbleRect = nil
         if let c = current, let i = shown.firstIndex(where: { $0.id == c.seat }) {
@@ -1511,8 +1516,8 @@ final class OfficeView: NSView {
     private func drawFlights(_ now: Date) {
         for f in flights {
             guard let end = headPoint(f.to) else { continue }
-            // 보낸 책상이 화면에 없으면(+N 이거나 모르는 세션) 오른쪽 끝에서 날아온다
-            let start = f.from.flatMap { headPoint($0) } ?? NSPoint(x: bounds.width - 10, y: end.y + 10)
+            // 보낸 책상이 화면에 없으면(+N 이거나 모르는 세션) +N 이 있는 왼쪽 끝에서 날아온다
+            let start = f.from.flatMap { headPoint($0) } ?? NSPoint(x: 10, y: end.y + 10)
             let t = now.timeIntervalSince(f.start)
             var p = end, scale: CGFloat = 1, alpha: CGFloat = 1
             if t < OfficeView.flightTime {
